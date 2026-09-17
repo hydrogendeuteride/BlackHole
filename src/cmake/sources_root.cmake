@@ -1,0 +1,3 @@
+list(APPEND BLACKHOLE_APP_SOURCES
+  main.cpp
+)

@@ -1,0 +1,110 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "windows-clangcl-base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang-cl",
+        "CMAKE_CXX_COMPILER": "clang-cl",
+        "CMAKE_LINKER": "lld-link",
+        "CMAKE_RC_COMPILER": "llvm-rc",
+        "HAVE_POSIX_FORK": "FALSE",
+        "HAVE_POSIX_WAIT": "FALSE",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VULKAN_ENGINE_BUILD_TESTS": "OFF",
+        "VULKAN_ENGINE_OUTPUT_TO_SOURCE_ROOT": "ON",
+        "VULKAN_ENGINE_NATIVE_CPU": "OFF"
+      }
+    },
+    {
+      "name": "windows-clangcl-release",
+      "displayName": "Windows clang-cl Release",
+      "inherits": "windows-clangcl-base",
+      "binaryDir": "${sourceDir}/build-windows",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "windows-clangcl-debug",
+      "displayName": "Windows clang-cl Debug",
+      "inherits": "windows-clangcl-base",
+      "binaryDir": "${sourceDir}/build-windows-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "linux-clang-base",
+      "hidden": true,
+      "generator": "Unix Makefiles",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "VULKAN_ENGINE_BUILD_TESTS": "OFF",
+        "VULKAN_ENGINE_OUTPUT_TO_SOURCE_ROOT": "ON",
+        "VULKAN_ENGINE_NATIVE_CPU": "OFF"
+      }
+    },
+    {
+      "name": "linux-clang-release",
+      "displayName": "Linux clang Release",
+      "inherits": "linux-clang-base",
+      "binaryDir": "${sourceDir}/build-linux",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "linux-clang-debug",
+      "displayName": "Linux clang Debug",
+      "inherits": "linux-clang-base",
+      "binaryDir": "${sourceDir}/build-linux-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "windows-clangcl-release",
+      "configurePreset": "windows-clangcl-release",
+      "jobs": 16,
+      "targets": [
+        "blackhole"
+      ]
+    },
+    {
+      "name": "windows-clangcl-debug",
+      "configurePreset": "windows-clangcl-debug",
+      "jobs": 16,
+      "targets": [
+        "blackhole"
+      ]
+    },
+    {
+      "name": "linux-clang-release",
+      "configurePreset": "linux-clang-release",
+      "jobs": 16,
+      "targets": [
+        "blackhole"
+      ]
+    },
+    {
+      "name": "linux-clang-debug",
+      "configurePreset": "linux-clang-debug",
+      "jobs": 16,
+      "targets": [
+        "blackhole"
+      ]
+    }
+  ]
+}

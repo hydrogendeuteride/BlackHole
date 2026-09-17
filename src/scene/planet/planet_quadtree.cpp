@@ -1,0 +1,580 @@
+#include "planet_quadtree.h"
+
+#include "scene/frustum_culling.h"
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <limits>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <glm/gtc/constants.hpp>
+
+namespace planet
+{
+    namespace
+    {
+        struct Node
+        {
+            PatchKey key{};
+        };
+
+        void compute_patch_visibility_terms(const PatchKey &key,
+                                            const glm::dvec3 &patch_center_dir,
+                                            double radius_m,
+                                            double max_height_m,
+                                            double &out_cos_patch_radius,
+                                            double &out_sin_patch_radius,
+                                            double &out_bound_radius_m)
+        {
+            glm::dvec3 c = patch_center_dir;
+            const double c_len2 = glm::dot(c, c);
+            if (!(c_len2 > 0.0))
+            {
+                c = glm::dvec3(0.0, 0.0, 1.0);
+            }
+            else
+            {
+                c *= (1.0 / std::sqrt(c_len2));
+            }
+
+            double u0 = 0.0, u1 = 0.0, v0 = 0.0, v1 = 0.0;
+            cubesphere_tile_uv_bounds(key.level, key.x, key.y, u0, u1, v0, v1);
+
+            // Conservative angular radius: max angle from patch center direction to any corner direction.
+            double min_dot = 1.0;
+            min_dot = std::min(min_dot, glm::dot(c, cubesphere_unit_direction(key.face, u0, v0)));
+            min_dot = std::min(min_dot, glm::dot(c, cubesphere_unit_direction(key.face, u1, v0)));
+            min_dot = std::min(min_dot, glm::dot(c, cubesphere_unit_direction(key.face, u0, v1)));
+            min_dot = std::min(min_dot, glm::dot(c, cubesphere_unit_direction(key.face, u1, v1)));
+
+            const double cos_a = glm::clamp(min_dot, -1.0, 1.0);
+            const double sin_a = std::sqrt(glm::max(0.0, 1.0 - cos_a * cos_a));
+
+            // Vertex positions are built as (unit_dir - patch_center_dir) * radius (chord length).
+            const double chord_r = radius_m * std::sqrt(glm::max(0.0, 2.0 - 2.0 * cos_a));
+
+            // Skirts extend inward; add a small safety margin so CPU culling stays conservative.
+            const double skirt_depth = cubesphere_skirt_depth_m(radius_m, key.level);
+
+            out_cos_patch_radius = cos_a;
+            out_sin_patch_radius = sin_a;
+            out_bound_radius_m = glm::max(1.0, chord_r + skirt_depth + glm::max(0.0, max_height_m));
+        }
+
+        bool is_patch_visible_horizon(const WorldVec3 &body_center_world,
+                                      double radius_m,
+                                      const WorldVec3 &camera_world,
+                                      const glm::dvec3 &patch_center_dir,
+                                      double cos_patch_radius,
+                                      double sin_patch_radius)
+        {
+            const glm::dvec3 w = camera_world - body_center_world;
+            const double d = glm::length(w);
+            if (d <= radius_m || d <= 0.0)
+            {
+                return true;
+            }
+
+            const glm::dvec3 w_dir = w / d;
+            const double cos_theta = glm::dot(patch_center_dir, w_dir);
+
+            // Horizon angle: cos(theta_h) = R / d
+            const double cos_h = glm::clamp(radius_m / d, 0.0, 1.0);
+            const double sin_h = std::sqrt(glm::max(0.0, 1.0 - cos_h * cos_h));
+
+            // Visible if theta <= theta_h + ang:
+            // cos(theta) >= cos(theta_h + ang)
+            const double cos_limit = cos_h * cos_patch_radius - sin_h * sin_patch_radius;
+            if (!std::isfinite(cos_theta) || !std::isfinite(cos_limit))
+            {
+                return true; // fail-safe: avoid catastrophic full culls
+            }
+            return cos_theta >= cos_limit;
+        }
+
+        bool is_patch_visible_frustum(const scene::frustum::PlaneSet &frustum,
+                                      const glm::vec3 &center_local,
+                                      float bound_radius_m)
+        {
+            if (!(bound_radius_m > 0.0f))
+            {
+                bound_radius_m = 1.0f;
+            }
+            return scene::frustum::intersects_sphere(frustum, center_local, bound_radius_m);
+        }
+
+        bool find_leaf_containing(const std::unordered_set<PatchKey, PatchKeyHash> &leaf_set,
+                                  CubeFace face,
+                                  double u01,
+                                  double v01,
+                                  uint32_t max_level,
+                                  PatchKey &out_key)
+        {
+            const double uu = glm::clamp(u01, 0.0, std::nextafter(1.0, 0.0));
+            const double vv = glm::clamp(v01, 0.0, std::nextafter(1.0, 0.0));
+
+            for (int32_t level = static_cast<int32_t>(max_level); level >= 0; --level)
+            {
+                const uint32_t l = static_cast<uint32_t>(level);
+                const uint32_t tiles = (l < 31u) ? (1u << l) : 0u;
+                if (tiles == 0u)
+                {
+                    continue;
+                }
+
+                const uint32_t xi = std::min(tiles - 1u, static_cast<uint32_t>(uu * static_cast<double>(tiles)));
+                const uint32_t yi = std::min(tiles - 1u, static_cast<uint32_t>(vv * static_cast<double>(tiles)));
+
+                const PatchKey key{face, l, xi, yi};
+                if (leaf_set.contains(key))
+                {
+                    out_key = key;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        bool patch_needs_balance_split(const PatchKey &key,
+                                       const std::unordered_set<PatchKey, PatchKeyHash> &leaf_set,
+                                       uint32_t max_level_in_set)
+        {
+            double u0 = 0.0, u1 = 0.0, v0 = 0.0, v1 = 0.0;
+            cubesphere_tile_uv_bounds(key.level, key.x, key.y, u0, u1, v0, v1);
+
+            const double du = std::abs(u1 - u0);
+            const double dv = std::abs(v1 - v0);
+            const double eps_u = glm::max(1e-9, du * 1e-3);
+            const double eps_v = glm::max(1e-9, dv * 1e-3);
+            constexpr std::array<double, 3> samples{0.2, 0.5, 0.8};
+
+            auto sample_neighbor = [&](double u, double v, PatchKey &out_neighbor) -> bool {
+                const glm::dvec3 dir = cubesphere_unit_direction(key.face, u, v);
+                CubeFace face = CubeFace::PosX;
+                double su = 0.0;
+                double sv = 0.0;
+                if (!cubesphere_direction_to_face_uv(dir, face, su, sv))
+                {
+                    return false;
+                }
+
+                if (!find_leaf_containing(leaf_set, face, su, sv, max_level_in_set, out_neighbor))
+                {
+                    return false;
+                }
+                return true;
+            };
+
+            for (const double t: samples)
+            {
+                const double vmid = glm::mix(v0, v1, t);
+                const double umid = glm::mix(u0, u1, t);
+
+                PatchKey neighbor{};
+                if (sample_neighbor(u0 - eps_u, vmid, neighbor))
+                {
+                    const uint32_t allowed_delta = (neighbor.face != key.face) ? 0u : 1u;
+                    if (neighbor.level > key.level + allowed_delta)
+                    {
+                        return true;
+                    }
+                }
+                if (sample_neighbor(u1 + eps_u, vmid, neighbor))
+                {
+                    const uint32_t allowed_delta = (neighbor.face != key.face) ? 0u : 1u;
+                    if (neighbor.level > key.level + allowed_delta)
+                    {
+                        return true;
+                    }
+                }
+                if (sample_neighbor(umid, v0 - eps_v, neighbor))
+                {
+                    const uint32_t allowed_delta = (neighbor.face != key.face) ? 0u : 1u;
+                    if (neighbor.level > key.level + allowed_delta)
+                    {
+                        return true;
+                    }
+                }
+                if (sample_neighbor(umid, v1 + eps_v, neighbor))
+                {
+                    const uint32_t allowed_delta = (neighbor.face != key.face) ? 0u : 1u;
+                    if (neighbor.level > key.level + allowed_delta)
+                    {
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        PatchKey patch_parent(const PatchKey &key)
+        {
+            if (key.level == 0u)
+            {
+                return key;
+            }
+
+            return PatchKey{
+                key.face,
+                key.level - 1u,
+                key.x >> 1u,
+                key.y >> 1u,
+            };
+        }
+
+        float patch_local_variance(const HeightFaceSet *height_faces, const PatchKey &key)
+        {
+            if (!height_faces)
+            {
+                return 0.0f;
+            }
+
+            const uint32_t face_index = static_cast<uint32_t>(key.face);
+            if (face_index >= height_faces->size())
+            {
+                return 0.0f;
+            }
+
+            const HeightFace &face = (*height_faces)[face_index];
+            if (face.width == 0u || face.height == 0u || face.texels.empty() || face.variance_mips.empty())
+            {
+                return 0.0f;
+            }
+
+            double u0 = 0.0, u1 = 0.0, v0 = 0.0, v1 = 0.0;
+            cubesphere_tile_uv_bounds(key.level, key.x, key.y, u0, u1, v0, v1);
+
+            const float u01 = static_cast<float>(((u0 + u1) * 0.25) + 0.5);
+            const float v01 = static_cast<float>(((v0 + v1) * 0.25) + 0.5);
+            const uint32_t aggregate_mip = choose_height_mip_level(face, key.level, 2u);
+            return glm::clamp(sample_height_variance(face, u01, v01, aggregate_mip), 0.0f, 1.0f);
+        }
+
+        float patch_terminator_weight(const glm::dvec3 &patch_dir, const glm::dvec3 &sun_dir)
+        {
+            const double sun_len2 = glm::dot(sun_dir, sun_dir);
+            if (!(sun_len2 > 0.0))
+            {
+                return 0.0f;
+            }
+
+            const double abs_dot = std::abs(glm::dot(patch_dir, sun_dir * (1.0 / std::sqrt(sun_len2))));
+            return 1.0f - glm::smoothstep(0.0f, 0.35f, static_cast<float>(glm::clamp(abs_dot, 0.0, 1.0)));
+        }
+    } // namespace
+
+    void PlanetQuadtree::update(const WorldVec3 &body_center_world,
+                                double radius_m,
+                                double max_height_m,
+                                const WorldVec3 &camera_world,
+                                const WorldVec3 &origin_world,
+                                const GPUSceneData &scene_data,
+                                VkExtent2D logical_extent,
+                                uint32_t patch_resolution,
+                                const HeightFaceSet *height_faces)
+    {
+        const std::vector<PatchKey> previous_visible_leaves = _visible_leaves;
+        _visible_leaves.clear();
+        _stats = {};
+
+        if (radius_m <= 0.0)
+        {
+            return;
+        }
+
+        if (logical_extent.width == 0 || logical_extent.height == 0)
+        {
+            logical_extent = VkExtent2D{1920, 1080};
+        }
+
+        const bool rt_shadows_enabled = (scene_data.rtOptions.x != 0u) && (scene_data.rtOptions.z != 0u);
+        const double cam_alt_m = glm::length(camera_world - body_center_world) - radius_m;
+        const bool camera_outside = (cam_alt_m >= 0.0);
+        const bool rt_guardrail_active =
+                _settings.rt_guardrail &&
+                rt_shadows_enabled &&
+                camera_outside &&
+                (_settings.max_patch_edge_rt_m > 0.0) &&
+                (cam_alt_m <= _settings.rt_guardrail_max_altitude_m);
+
+        const float proj_y = scene_data.proj[1][1];
+        const float proj_scale = std::abs(proj_y) * (static_cast<float>(logical_extent.height) * 0.5f);
+        if (!(proj_scale > 0.0f))
+        {
+            return;
+        }
+        const scene::frustum::PlaneSet frustum = scene::frustum::extract_clip_planes(scene_data.viewproj);
+
+        std::unordered_map<PatchKey, uint32_t, PatchKeyHash> previous_max_levels;
+        previous_max_levels.reserve(previous_visible_leaves.size() * 3u + 16u);
+        for (const PatchKey &leaf : previous_visible_leaves)
+        {
+            PatchKey current = leaf;
+            while (true)
+            {
+                auto [it, inserted] = previous_max_levels.emplace(current, leaf.level);
+                if (!inserted)
+                {
+                    it->second = std::max(it->second, leaf.level);
+                }
+
+                if (current.level == 0u)
+                {
+                    break;
+                }
+                current = patch_parent(current);
+            }
+        }
+
+        const float hysteresis = glm::clamp(_settings.lod_hysteresis_ratio, 0.0f, 0.95f);
+        const float split_threshold = _settings.target_sse_px * (1.0f + hysteresis);
+        const float keep_threshold = _settings.target_sse_px * std::max(0.0f, 1.0f - hysteresis);
+        const glm::dvec3 sun_dir = glm::dvec3(scene_data.sunlightDirection);
+
+        thread_local std::vector<Node> stack;
+        stack.clear();
+        stack.reserve(256);
+
+        const size_t max_visible_leaves =
+                (_settings.max_patches_visible > 0u)
+                    ? static_cast<size_t>(std::max(_settings.max_patches_visible, 6u))
+                    : std::numeric_limits<size_t>::max();
+
+        auto push_root = [&](CubeFace face) {
+            Node n{};
+            n.key.face = face;
+            n.key.level = 0;
+            n.key.x = 0;
+            n.key.y = 0;
+            stack.push_back(n);
+        };
+
+        // Push in reverse order so pop_back visits in +X,-X,+Y,-Y,+Z,-Z order.
+        push_root(CubeFace::NegZ);
+        push_root(CubeFace::PosZ);
+        push_root(CubeFace::NegY);
+        push_root(CubeFace::PosY);
+        push_root(CubeFace::NegX);
+        push_root(CubeFace::PosX);
+
+        const double height_guard = glm::max(0.0, max_height_m);
+        const double radius_for_horizon = radius_m + height_guard;
+
+        while (!stack.empty())
+        {
+            Node n = stack.back();
+            stack.pop_back();
+            _stats.nodes_visited++;
+
+            const PatchKey &k = n.key;
+
+            const double patch_edge_m = cubesphere_patch_edge_m(radius_m, k.level);
+            const glm::dvec3 patch_dir = cubesphere_patch_center_direction(k.face, k.level, k.x, k.y);
+
+            double cos_patch_radius = 1.0;
+            double sin_patch_radius = 0.0;
+            double patch_bound_r_m = 1.0;
+            if (_settings.horizon_cull || _settings.frustum_cull)
+            {
+                compute_patch_visibility_terms(k, patch_dir, radius_m, height_guard, cos_patch_radius, sin_patch_radius,
+                                               patch_bound_r_m);
+            }
+
+            if (_settings.horizon_cull)
+            {
+                if (!is_patch_visible_horizon(body_center_world,
+                                              radius_for_horizon,
+                                              camera_world,
+                                              patch_dir,
+                                              cos_patch_radius,
+                                              sin_patch_radius))
+                {
+                    _stats.nodes_culled++;
+                    continue;
+                }
+            }
+
+            const WorldVec3 patch_center_world =
+                    body_center_world + patch_dir * radius_m;
+
+            if (_settings.frustum_cull)
+            {
+                const glm::vec3 patch_center_local = world_to_local(patch_center_world, origin_world);
+                const float bound_r = static_cast<float>(patch_bound_r_m);
+                if (!is_patch_visible_frustum(frustum, patch_center_local, bound_r))
+                {
+                    _stats.nodes_culled++;
+                    continue;
+                }
+            }
+
+            const double dist_m = glm::max(1.0, glm::length(camera_world - patch_center_world));
+
+            // Screen-space error metric.
+            const uint32_t safe_res = std::max(2u, patch_resolution);
+            const double segments = static_cast<double>(safe_res - 1u);
+            const double error_m = 0.5 * patch_edge_m / segments;
+            const float sse_px = static_cast<float>((error_m / dist_m) * static_cast<double>(proj_scale));
+            const float local_variance = patch_local_variance(height_faces, k);
+            const float terminator_factor = patch_terminator_weight(patch_dir, sun_dir);
+            const float weighted_sse = sse_px *
+                                       (1.0f + 1.5f * local_variance) *
+                                       (1.0f + 1.0f * terminator_factor);
+
+            bool was_refined_last_frame = false;
+            if (const auto previous_it = previous_max_levels.find(k); previous_it != previous_max_levels.end())
+            {
+                was_refined_last_frame = previous_it->second > k.level;
+            }
+
+            const float refine_threshold = was_refined_last_frame ? keep_threshold : split_threshold;
+            bool refine = (k.level < _settings.max_level) && (weighted_sse > refine_threshold);
+            if (!refine && rt_guardrail_active && (k.level < _settings.max_level) && (
+                    patch_edge_m > _settings.max_patch_edge_rt_m))
+            {
+                refine = true;
+            }
+
+            if (refine)
+            {
+                // Budget check: splitting replaces this node with 4 children (adds +3 leaves minimum).
+                // Keep a stable upper bound on the final leaf count: leaves_so_far + stack.size() + 4.
+                const size_t min_leaves_if_split = _visible_leaves.size() + stack.size() + 4u;
+                if (min_leaves_if_split > max_visible_leaves)
+                {
+                    refine = false;
+                    _stats.splits_budget_limited++;
+                }
+            }
+
+            if (refine)
+            {
+                // Child order: (0,0), (1,0), (0,1), (1,1) with y increasing downward.
+                const uint32_t cl = k.level + 1u;
+                const uint32_t cx = k.x * 2u;
+                const uint32_t cy = k.y * 2u;
+
+                stack.push_back(Node{PatchKey{k.face, cl, cx + 1u, cy + 1u}});
+                stack.push_back(Node{PatchKey{k.face, cl, cx + 0u, cy + 1u}});
+                stack.push_back(Node{PatchKey{k.face, cl, cx + 1u, cy + 0u}});
+                stack.push_back(Node{PatchKey{k.face, cl, cx + 0u, cy + 0u}});
+                continue;
+            }
+
+            _visible_leaves.push_back(k);
+            _stats.max_level_used = std::max(_stats.max_level_used, k.level);
+        }
+
+        // Enforce 2:1 LOD balance so neighboring patches differ by at most one level.
+        // This reduces cracks/popping along LOD boundaries while keeping the leaf set deterministic.
+        if (!_visible_leaves.empty())
+        {
+            constexpr uint32_t kMaxBalancePasses = 8u;
+            for (uint32_t pass = 0u; pass < kMaxBalancePasses; ++pass)
+            {
+                std::unordered_set<PatchKey, PatchKeyHash> leaf_set;
+                leaf_set.reserve(_visible_leaves.size() * 2u);
+                uint32_t max_level_in_set = 0u;
+                for (const PatchKey &k: _visible_leaves)
+                {
+                    leaf_set.insert(k);
+                    max_level_in_set = std::max(max_level_in_set, k.level);
+                }
+
+                std::vector<PatchKey> split_candidates;
+                split_candidates.reserve(_visible_leaves.size() / 8u + 16u);
+                for (const PatchKey &k: _visible_leaves)
+                {
+                    if (k.level >= _settings.max_level)
+                    {
+                        continue;
+                    }
+                    if (patch_needs_balance_split(k, leaf_set, max_level_in_set))
+                    {
+                        split_candidates.push_back(k);
+                    }
+                }
+
+                if (split_candidates.empty())
+                {
+                    break;
+                }
+
+                std::unordered_set<PatchKey, PatchKeyHash> split_set;
+                split_set.reserve(split_candidates.size() * 2u);
+                for (const PatchKey &k: split_candidates)
+                {
+                    split_set.insert(k);
+                }
+
+                size_t split_budget = split_candidates.size();
+                const size_t projected = _visible_leaves.size() + split_budget * 3u;
+                if (projected > max_visible_leaves)
+                {
+                    const size_t excess = projected - max_visible_leaves;
+                    const size_t drop = (excess + 2u) / 3u; // each dropped split removes +3 leaves
+                    if (drop >= split_budget)
+                    {
+                        _stats.splits_budget_limited += static_cast<uint32_t>(split_budget);
+                        break;
+                    }
+                    split_budget -= drop;
+                    _stats.splits_budget_limited += static_cast<uint32_t>(drop);
+                }
+
+                std::vector<PatchKey> balanced;
+                balanced.reserve(_visible_leaves.size() + split_budget * 3u);
+
+                size_t splits_applied = 0u;
+                for (const PatchKey &k: _visible_leaves)
+                {
+                    const bool should_split =
+                            split_set.contains(k) &&
+                            (splits_applied < split_budget) &&
+                            (k.level < _settings.max_level);
+
+                    if (!should_split)
+                    {
+                        balanced.push_back(k);
+                        continue;
+                    }
+
+                    const uint32_t cl = k.level + 1u;
+                    const uint32_t cx = k.x * 2u;
+                    const uint32_t cy = k.y * 2u;
+                    balanced.push_back(PatchKey{k.face, cl, cx + 0u, cy + 0u});
+                    balanced.push_back(PatchKey{k.face, cl, cx + 1u, cy + 0u});
+                    balanced.push_back(PatchKey{k.face, cl, cx + 0u, cy + 1u});
+                    balanced.push_back(PatchKey{k.face, cl, cx + 1u, cy + 1u});
+                    splits_applied++;
+                }
+
+                if (splits_applied == 0u)
+                {
+                    break;
+                }
+                _visible_leaves.swap(balanced);
+            }
+        }
+
+        // Keep deterministic order for stability (optional).
+        // DFS already stable; sort is useful when culling changes traversal.
+        std::sort(_visible_leaves.begin(), _visible_leaves.end(),
+                  [](const PatchKey &a, const PatchKey &b) {
+                      if (a.face != b.face) return a.face < b.face;
+                      if (a.level != b.level) return a.level < b.level;
+                      if (a.x != b.x) return a.x < b.x;
+                      return a.y < b.y;
+                  });
+
+        _stats.visible_leaves = static_cast<uint32_t>(_visible_leaves.size());
+        _stats.max_level_used = 0u;
+        for (const PatchKey &k: _visible_leaves)
+        {
+            _stats.max_level_used = std::max(_stats.max_level_used, k.level);
+        }
+    }
+} // namespace planet

@@ -1,0 +1,33 @@
+/build/
+/build-*/
+/cmake-build-*/
+/bin/
+/lib/
+/logs/
+/tmp/
+/compile_commands.json
+/CMakeUserPresets.json
+/.idea/
+/.vscode/
+/.zed/
+/.venv/
+/__pycache__/
+*.pyc
+*.spv
+*.log
+/imgui.ini
+/nul
+/.clangd
+
+# Local planning and diagnostic captures
+/debug*.png
+/plan*.md
+*plans.*
+*review*
+blackhole_project.md
+AGENTS.md
+
+# Vendored examples/build output
+/third_party/ImGuizmo/bin/
+/third_party/ImGuizmo/example/
+/third_party/ImGuizmo/vcpkg-example/

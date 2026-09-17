@@ -1,0 +1,60 @@
+#pragma once
+#include "render/renderpass.h"
+#include <render/graph/types.h>
+#include <span>
+#include "render/passes/cloud_shadow.h"
+
+class LightingPass : public IRenderPass
+{
+public:
+    void init(EngineContext *context) override;
+
+    void cleanup() override;
+
+    void execute(VkCommandBuffer cmd) override;
+
+    const char *getName() const override { return "Lighting"; }
+
+    // Register lighting; consumes GBuffer + CSM cascades.
+    void register_graph(class RenderGraph *graph,
+                        RGImageHandle drawHandle,
+                        RGImageHandle gbufferPosition,
+                        RGImageHandle gbufferNormal,
+                        RGImageHandle gbufferAlbedo,
+                        RGImageHandle gbufferExtra,
+                        std::span<RGImageHandle> shadowCascades,
+                        std::span<RGImageHandle> spotShadowMaps,
+                        std::span<RGImageHandle> pointShadowFaces,
+                        CloudShadowMap cloudShadow);
+
+private:
+    EngineContext *_context = nullptr;
+
+    VkDescriptorSetLayout _gBufferInputDescriptorLayout = VK_NULL_HANDLE;
+    VkDescriptorSetLayout _shadowDescriptorLayout = VK_NULL_HANDLE; // set=2 (array)
+    VkDescriptorSetLayout _spotShadowDescriptorLayout = VK_NULL_HANDLE; // set=4 (array)
+    VkDescriptorSetLayout _pointShadowDescriptorLayout = VK_NULL_HANDLE; // set=5 (array)
+    // Fallbacks if IBL is not loaded
+    AllocatedImage _fallbackIbl2D{};       // 1x1 black
+    AllocatedImage _fallbackBrdfLut2D{};   // 1x1 RG, black
+
+    VkPipelineLayout _pipelineLayout = VK_NULL_HANDLE;
+    VkPipeline _pipeline = VK_NULL_HANDLE;
+    VkDescriptorSetLayout _emptySetLayout = VK_NULL_HANDLE; // placeholder if IBL layout missing
+    bool _rtPipelineCreateAttempted = false; // create deferred_lighting.rt lazily
+
+    void draw_lighting(VkCommandBuffer cmd,
+                       EngineContext *context,
+                       const class RGPassResources &resources,
+                       RGImageHandle drawHandle,
+                       RGImageHandle gbufferPosition,
+                       RGImageHandle gbufferNormal,
+                       RGImageHandle gbufferAlbedo,
+                       RGImageHandle gbufferExtra,
+                       std::span<RGImageHandle> shadowCascades,
+                       std::span<RGImageHandle> spotShadowMaps,
+                       std::span<RGImageHandle> pointShadowFaces,
+                       CloudShadowMap cloudShadow);
+
+    DeletionQueue _deletionQueue;
+};

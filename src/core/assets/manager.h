@@ -1,0 +1,250 @@
+#pragma once
+
+#include <memory>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <filesystem>
+#include <vector>
+#include <utility>
+#include <mutex>
+
+#include <scene/vk_loader.h>
+#include <core/types.h>
+#include <core/assets/texture_cache.h>
+
+#include "render/materials.h"
+#include "locator.h"
+
+class VulkanEngine;
+struct MeshAsset;
+
+class AssetManager
+{
+public:
+    struct MeshVfxMaterialSettings
+    {
+        glm::vec3 tint{1.0f, 1.0f, 1.0f};
+        float opacity{0.5f};
+        float fresnelPower{3.0f};
+        float fresnelStrength{1.0f};
+        std::string albedoPath;
+        bool albedoSRGB = true;
+
+        std::string noise1Path;
+        std::string noise2Path;
+        bool noise1SRGB = false;
+        bool noise2SRGB = false;
+        glm::vec2 scrollVelocity1{0.f, -1.f};
+        glm::vec2 scrollVelocity2{0.f, -0.5f};
+        float distortionStrength{0.1f};
+        float noiseBlend{0.5f};
+        glm::vec3 coreColor{1.f};
+        glm::vec3 edgeColor{1.f, 0.5f, 0.f};
+        float gradientAxis{1.f};
+        float gradientStart{0.f};
+        float gradientEnd{1.f};
+        float emissionStrength{1.f};
+    };
+
+    struct BlackbodySettings
+    {
+        // Tileable noise texture path relative to assets/ (bound to emissiveTex).
+        std::string noisePath;
+        // Emission control
+        float intensity{1.0f};
+        float tempMinK{1000.0f};
+        float tempMaxK{4000.0f};
+        // Noise sampling in object space
+        float noiseScale{1.0f};
+        float noiseContrast{1.0f};
+        glm::vec2 noiseScroll{0.0f, 0.0f};
+        // Animation speed multiplier (1.0 = previous behavior, lower = slower).
+        float noiseSpeed{1.0f};
+        // Local-space axis and hot-end selection for nozzle/barrel-like heat falloff.
+        glm::vec3 heatAxisLocal{0.0f, 1.0f, 0.0f};
+        float hotEndBias{1.0f}; // -1: -axis end, +1: +axis end, 0: both ends
+        // Axial hot zone range in [0,1] after axis projection normalization.
+        float hotRangeStart{0.68f};
+        float hotRangeEnd{0.98f};
+    };
+
+    // PBR material with optional blackbody emission (procedural, driven by noise texture).
+    // Notes:
+    // - When blackbody is enabled, emissiveTex (set=1,binding=5) is treated as a noise texture (linear).
+    // - base textures are optional; omitted ones fall back to engine defaults.
+    struct BlackbodyMaterialSettings
+    {
+        glm::vec4 colorFactor{1.0f};
+        float metallic{0.0f};
+        float roughness{1.0f};
+        float normalScale{1.0f};
+
+        std::string albedoPath;
+        bool albedoSRGB = true;
+        std::string metalRoughPath;
+        bool metalRoughSRGB = false;
+        std::string normalPath;
+        bool normalSRGB = false;
+        std::string occlusionPath;
+        bool occlusionSRGB = false;
+        float occlusionStrength{1.0f};
+
+        BlackbodySettings blackbody{};
+    };
+
+    struct MaterialOptions
+    {
+        std::string albedoPath;
+        std::string metalRoughPath;
+        // Optional tangent-space normal map for PBR (placeholder; not wired yet)
+        // When enabled later, this will be sampled in shaders and requires tangents.
+        std::string normalPath;
+        std::string occlusionPath;
+        std::string emissivePath;
+
+        bool albedoSRGB = true;
+        bool metalRoughSRGB = false;
+        bool normalSRGB = false; // normal maps are typically non-sRGB
+        bool occlusionSRGB = false;
+        bool emissiveSRGB = true;
+
+        GLTFMetallic_Roughness::MaterialConstants constants{};
+
+        MaterialPass pass = MaterialPass::MainColor;
+    };
+
+    struct MeshGeometryDesc
+    {
+        enum class Type { Provided, Cube, Sphere, Plane, Capsule };
+
+        Type type = Type::Provided;
+        std::span<Vertex> vertices{};
+        std::span<uint32_t> indices{};
+        int sectors = 32;
+        int stacks = 32;
+    };
+
+    struct MeshMaterialDesc
+    {
+        enum class Kind { Default, Textured };
+
+        Kind kind = Kind::Default;
+        MaterialOptions options{};
+    };
+
+    struct MeshCreateInfo
+    {
+        std::string name;
+        MeshGeometryDesc geometry;
+        MeshMaterialDesc material;
+        // Optional override for collision / picking bounds type for this mesh.
+        // When unset, a reasonable default is chosen based on geometry.type.
+        std::optional<BoundsType> boundsType;
+    };
+
+    void init(VulkanEngine *engine);
+
+    void cleanup();
+
+    std::string shaderPath(std::string_view name) const;
+
+    std::string modelPath(std::string_view name) const;
+
+    std::string assetPath(std::string_view name) const;
+
+    std::optional<std::shared_ptr<LoadedGLTF> > loadGLTF(std::string_view nameOrPath);
+    std::optional<std::shared_ptr<LoadedGLTF> > loadGLTF(std::string_view nameOrPath,
+                                                         const GLTFLoadCallbacks *cb);
+
+    // Queue texture loads for a glTF file ahead of time. This parses the glTF,
+    // builds TextureCache keys for referenced images (both external URIs and
+    // embedded images in buffers), and issues TextureCache::request() calls.
+    // Actual uploads happen via the normal per-frame pump.
+    // Returns number of textures scheduled.
+    size_t prefetchGLTFTextures(std::string_view nameOrPath);
+    struct GLTFTexturePrefetchResult
+    {
+        size_t scheduled = 0;
+        std::vector<TextureCache::TextureHandle> handles;
+    };
+    GLTFTexturePrefetchResult prefetchGLTFTexturesWithHandles(std::string_view nameOrPath);
+
+    std::shared_ptr<MeshAsset> createMesh(const MeshCreateInfo &info);
+
+    std::shared_ptr<MeshAsset> getPrimitive(std::string_view name) const;
+
+    std::shared_ptr<MeshAsset> createMesh(const std::string &name,
+                                          std::span<Vertex> vertices,
+                                          std::span<uint32_t> indices,
+                                          std::shared_ptr<GLTFMaterial> material = {},
+                                          bool build_bvh = true);
+
+    std::shared_ptr<MeshAsset> getMesh(const std::string &name) const;
+
+    bool removeMesh(const std::string &name);
+    bool removeMeshDeferred(const std::string &name, DeletionQueue &dq);
+    bool removeMaterialBuffer(const std::string &name, DeletionQueue *dq = nullptr);
+
+    // Convenience: create a PBR material from constants using engine default textures
+    std::shared_ptr<GLTFMaterial> createMaterialFromConstants(const std::string &name,
+                                                              const GLTFMetallic_Roughness::MaterialConstants &constants,
+                                                              MaterialPass pass = MaterialPass::MainColor);
+
+    bool createOrUpdateMeshVfxMaterial(const std::string &name, const MeshVfxMaterialSettings &settings);
+    bool removeMeshVfxMaterial(const std::string &name);
+    bool getMeshVfxMaterialSettings(const std::string &name, MeshVfxMaterialSettings &out) const;
+    std::shared_ptr<GLTFMaterial> getMeshVfxMaterial(const std::string &name) const;
+
+    bool createOrUpdateBlackbodyMaterial(const std::string &name, const BlackbodyMaterialSettings &settings);
+    bool removeBlackbodyMaterial(const std::string &name);
+    bool getBlackbodyMaterialSettings(const std::string &name, BlackbodyMaterialSettings &out) const;
+    std::shared_ptr<GLTFMaterial> getBlackbodyMaterial(const std::string &name) const;
+
+    // Patch an existing glTF material in a loaded scene to use blackbody emission.
+    bool applyBlackbodyToGLTFMaterial(LoadedGLTF &scene,
+                                      const std::string &materialName,
+                                      const BlackbodySettings &settings);
+
+    // Access engine-provided fallback textures for procedural systems.
+    VkImageView fallbackCheckerboardView() const;
+    VkImageView fallbackWhiteView() const;
+    VkImageView fallbackFlatNormalView() const;
+    VkImageView fallbackBlackView() const;
+
+    const AssetPaths &paths() const { return _locator.paths(); }
+    void setPaths(const AssetPaths &p) { _locator.setPaths(p); }
+
+private:
+    VulkanEngine *_engine = nullptr;
+    AssetLocator _locator;
+
+    std::unordered_map<std::string, std::weak_ptr<LoadedGLTF> > _gltfCacheByPath;
+    mutable std::mutex _gltfMutex;
+    std::unordered_map<std::string, std::shared_ptr<MeshAsset> > _meshCache;
+    std::unordered_map<std::string, AllocatedBuffer> _meshMaterialBuffers;
+    std::unordered_map<std::string, std::vector<AllocatedImage> > _meshOwnedImages;
+    struct MeshVfxMaterialRecord
+    {
+        MeshVfxMaterialSettings settings{};
+        std::shared_ptr<GLTFMaterial> material;
+        AllocatedBuffer constantsBuffer{};
+    };
+    std::unordered_map<std::string, MeshVfxMaterialRecord> _meshVfxMaterials;
+
+    struct BlackbodyMaterialRecord
+    {
+        BlackbodyMaterialSettings settings{};
+        std::shared_ptr<GLTFMaterial> material;
+        AllocatedBuffer constantsBuffer{};
+    };
+    std::unordered_map<std::string, BlackbodyMaterialRecord> _blackbodyMaterials;
+
+    AllocatedBuffer createMaterialBufferWithConstants(const GLTFMetallic_Roughness::MaterialConstants &constants) const;
+
+    std::shared_ptr<GLTFMaterial> createMaterial(MaterialPass pass,
+                                                 const GLTFMetallic_Roughness::MaterialResources &res) const;
+
+    std::pair<AllocatedImage, bool> loadImageFromAsset(std::string_view path, bool srgb) const;
+};

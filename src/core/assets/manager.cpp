@@ -1,0 +1,1547 @@
+#include "manager.h"
+
+#include <algorithm>
+#include <cstdlib>
+#include <fstream>
+
+#include <core/engine.h>
+#include <core/device/resource.h>
+#include <render/materials.h>
+#include <render/primitives.h>
+#include <scene/tangent_space.h>
+#include <scene/mesh_bvh.h>
+#include <stb_image.h>
+#include "locator.h"
+#include <core/assets/texture_cache.h>
+#include <fastgltf/parser.hpp>
+#include <fastgltf/util.hpp>
+#include <fastgltf/tools.hpp>
+#include <nlohmann/json.hpp>
+
+using std::filesystem::path;
+
+namespace
+{
+    static bool file_exists_nothrow(const std::filesystem::path &p)
+    {
+        std::error_code ec;
+        return !p.empty() && std::filesystem::exists(p, ec) && !ec;
+    }
+
+    static std::string derive_gltf_collider_sidecar_path(const std::string &model_path)
+    {
+        if (model_path.empty())
+        {
+            return {};
+        }
+
+        const path p = path(model_path);
+        if (!p.has_extension())
+        {
+            return {};
+        }
+
+        const std::string stem = p.stem().string();
+        const std::string ext = p.extension().string();
+        return (p.parent_path() / (stem + ".colliders" + ext)).string();
+    }
+
+    static std::string derive_gltf_collider_json_path(const std::string &model_path)
+    {
+        if (model_path.empty())
+        {
+            return {};
+        }
+
+        const path p = path(model_path);
+        if (!p.has_extension())
+        {
+            return {};
+        }
+
+        const std::string stem = p.stem().string();
+        return (p.parent_path() / (stem + ".colliders.json")).string();
+    }
+
+    static std::optional<std::unordered_map<std::string, float>> load_collider_mass_overrides_json(const std::string &json_path)
+    {
+        using json = nlohmann::json;
+
+        std::ifstream file(json_path);
+        if (!file)
+        {
+            return {};
+        }
+
+        try
+        {
+            json root;
+            file >> root;
+
+            const json *masses = &root;
+            if (root.is_object())
+            {
+                auto it = root.find("masses");
+                if (it != root.end())
+                {
+                    masses = &(*it);
+                }
+            }
+
+            if (!masses->is_object())
+            {
+                Logger::warn("[AssetManager] collider mass json '{}' must be an object or contain an object 'masses'",
+                             json_path);
+                return {};
+            }
+
+            std::unordered_map<std::string, float> out;
+            for (auto it = masses->begin(); it != masses->end(); ++it)
+            {
+                float mass = 0.0f;
+                if (it->is_number())
+                {
+                    mass = it->get<float>();
+                }
+                else if (it->is_object())
+                {
+                    auto mass_it = it->find("mass");
+                    if (mass_it == it->end() || !mass_it->is_number())
+                    {
+                        Logger::warn("[AssetManager] collider mass entry '{}' in '{}' must be a number or object with numeric 'mass'",
+                                     it.key(), json_path);
+                        continue;
+                    }
+                    mass = mass_it->get<float>();
+                }
+                else
+                {
+                    Logger::warn("[AssetManager] collider mass entry '{}' in '{}' must be numeric",
+                                 it.key(), json_path);
+                    continue;
+                }
+
+                if (!std::isfinite(mass) || mass <= 0.0f)
+                {
+                    Logger::warn("[AssetManager] collider mass entry '{}' in '{}' has invalid mass {}",
+                                 it.key(), json_path, mass);
+                    continue;
+                }
+
+                out[it.key()] = mass;
+            }
+
+            return out;
+        }
+        catch (const std::exception &e)
+        {
+            Logger::warn("[AssetManager] failed to parse collider mass json '{}': {}", json_path, e.what());
+            return {};
+        }
+    }
+    static void clamp_blackbody_settings(AssetManager::BlackbodySettings &s)
+    {
+        s.intensity = std::max(s.intensity, 0.0f);
+        s.tempMinK = std::max(s.tempMinK, 0.0f);
+        s.tempMaxK = std::max(s.tempMaxK, 0.0f);
+        s.noiseScale = std::max(s.noiseScale, 0.001f);
+        s.noiseContrast = std::max(s.noiseContrast, 0.001f);
+        s.noiseSpeed = std::max(s.noiseSpeed, 0.0f);
+        float axis_len2 = glm::dot(s.heatAxisLocal, s.heatAxisLocal);
+        if (axis_len2 < 1e-8f)
+        {
+            s.heatAxisLocal = glm::vec3(0.0f, 1.0f, 0.0f);
+        }
+        else
+        {
+            s.heatAxisLocal = glm::normalize(s.heatAxisLocal);
+        }
+        s.hotEndBias = std::clamp(s.hotEndBias, -1.0f, 1.0f);
+        s.hotRangeStart = std::clamp(s.hotRangeStart, 0.0f, 1.0f);
+        s.hotRangeEnd = std::clamp(s.hotRangeEnd, 0.0f, 1.0f);
+        if (s.hotRangeEnd <= s.hotRangeStart)
+        {
+            s.hotRangeEnd = std::min(1.0f, s.hotRangeStart + 0.01f);
+        }
+    }
+} // namespace
+
+void AssetManager::init(VulkanEngine *engine)
+{
+    _engine = engine;
+    _locator.init();
+}
+
+void AssetManager::cleanup()
+{
+    if (_engine && _engine->_resourceManager)
+    {
+        for (auto &kv: _meshCache)
+        {
+            if (kv.second)
+            {
+                _engine->_resourceManager->destroy_buffer(kv.second->meshBuffers.indexBuffer);
+                _engine->_resourceManager->destroy_buffer(kv.second->meshBuffers.vertexBuffer);
+            }
+        }
+        for (auto &kv: _meshMaterialBuffers)
+        {
+            _engine->_resourceManager->destroy_buffer(kv.second);
+        }
+        for (auto &kv: _meshOwnedImages)
+        {
+            for (const auto &img: kv.second)
+            {
+                _engine->_resourceManager->destroy_image(img);
+            }
+        }
+        for (auto &kv: _meshVfxMaterials)
+        {
+            if (kv.second.constantsBuffer.buffer != VK_NULL_HANDLE)
+            {
+                _engine->_resourceManager->destroy_buffer(kv.second.constantsBuffer);
+            }
+            if (_engine->_textureCache && kv.second.material)
+            {
+                _engine->_textureCache->unwatchSet(kv.second.material->data.materialSet);
+            }
+        }
+        for (auto &kv: _blackbodyMaterials)
+        {
+            if (kv.second.constantsBuffer.buffer != VK_NULL_HANDLE)
+            {
+                _engine->_resourceManager->destroy_buffer(kv.second.constantsBuffer);
+            }
+            if (_engine->_textureCache && kv.second.material)
+            {
+                _engine->_textureCache->unwatchSet(kv.second.material->data.materialSet);
+            }
+        }
+    }
+    _meshCache.clear();
+    _meshMaterialBuffers.clear();
+    _meshOwnedImages.clear();
+    _meshVfxMaterials.clear();
+    _blackbodyMaterials.clear();
+    {
+        std::lock_guard<std::mutex> lock(_gltfMutex);
+        _gltfCacheByPath.clear();
+    }
+}
+
+std::string AssetManager::shaderPath(std::string_view name) const
+{
+    return _locator.shaderPath(name);
+}
+
+std::string AssetManager::assetPath(std::string_view name) const
+{
+    return _locator.assetPath(name);
+}
+
+std::string AssetManager::modelPath(std::string_view name) const
+{
+    return _locator.modelPath(name);
+}
+
+std::optional<std::shared_ptr<LoadedGLTF> > AssetManager::loadGLTF(std::string_view nameOrPath)
+{
+    return loadGLTF(nameOrPath, nullptr);
+}
+
+std::optional<std::shared_ptr<LoadedGLTF> > AssetManager::loadGLTF(std::string_view nameOrPath,
+                                                                   const GLTFLoadCallbacks *cb)
+{
+    if (!_engine) return {};
+    if (nameOrPath.empty()) return {};
+
+    std::string resolved = assetPath(nameOrPath);
+
+    path keyPath = resolved;
+    std::error_code ec;
+    keyPath = std::filesystem::weakly_canonical(keyPath, ec);
+    std::string key = (ec ? resolved : keyPath.string());
+
+    {
+        std::lock_guard<std::mutex> lock(_gltfMutex);
+        if (auto it = _gltfCacheByPath.find(key); it != _gltfCacheByPath.end())
+        {
+            if (auto sp = it->second.lock())
+            {
+                Logger::info("[AssetManager] loadGLTF cache hit key='{}' path='{}' ptr={}", key, resolved,
+                             static_cast<const void *>(sp.get()));
+                return sp;
+            }
+            Logger::info("[AssetManager] loadGLTF cache expired key='{}' path='{}' (reloading)", key, resolved);
+            _gltfCacheByPath.erase(it);
+        }
+    }
+
+    auto loaded = loadGltf(_engine, resolved, cb);
+    if (!loaded.has_value()) return {};
+
+    if (loaded.value())
+    {
+        // Check for cancellation before collider processing
+        if (cb && cb->is_cancelled && cb->is_cancelled())
+        {
+            return {};
+        }
+
+        // Attach physics collider definitions:
+        // - Prefer sibling "*.colliders.glb/gltf" if present
+        // - Otherwise fall back to embedded COL_* marker nodes (empties) in the visual glTF
+        const std::string sidecar_path = derive_gltf_collider_sidecar_path(resolved);
+        if (!sidecar_path.empty() && file_exists_nothrow(sidecar_path))
+        {
+            // Pass cancellation callback to sidecar load (progress not forwarded as main load is complete)
+            GLTFLoadCallbacks sidecar_cb{};
+            if (cb && cb->is_cancelled)
+            {
+                sidecar_cb.is_cancelled = cb->is_cancelled;
+            }
+
+            auto sidecar = loadGltf(_engine,
+                                    sidecar_path,
+                                    cb ? &sidecar_cb : nullptr,
+                                    GLTFLoadMode::ColliderCPUOnly);
+            if (sidecar.has_value() && sidecar.value())
+            {
+                if ((*sidecar)->debugName.empty())
+                {
+                    (*sidecar)->debugName = path(sidecar_path).filename().string();
+                }
+
+                (*loaded)->build_colliders_from_sidecar(*(*sidecar), true);
+                (*loaded)->build_mesh_colliders_from_sidecar(*(*sidecar), true);
+                (*loaded)->colliders_from_sidecar = true;
+                (*loaded)->collider_source_path = sidecar_path;
+            }
+            else
+            {
+                // Sidecar load failed or was cancelled - fall back to markers
+                if (cb && cb->is_cancelled && cb->is_cancelled())
+                {
+                    return {};
+                }
+                Logger::warn("[AssetManager] Warning: collider sidecar exists but failed to load ('{}')", sidecar_path);
+                (*loaded)->build_colliders_from_markers(true);
+                (*loaded)->build_mesh_colliders_from_markers(true);
+                (*loaded)->colliders_from_sidecar = false;
+                (*loaded)->collider_source_path.clear();
+            }
+        }
+        else
+        {
+            (*loaded)->build_colliders_from_markers(true);
+            (*loaded)->build_mesh_colliders_from_markers(true);
+            (*loaded)->colliders_from_sidecar = false;
+            (*loaded)->collider_source_path.clear();
+        }
+
+        const std::string collider_json_path = derive_gltf_collider_json_path(resolved);
+        if (!collider_json_path.empty() && file_exists_nothrow(collider_json_path))
+        {
+            if (auto mass_overrides = load_collider_mass_overrides_json(collider_json_path); mass_overrides.has_value())
+            {
+                (*loaded)->apply_collider_child_mass_overrides(*mass_overrides);
+            }
+        }
+
+        Logger::info("[AssetManager] loadGLTF loaded new scene key='{}' path='{}' ptr={}", key, resolved,
+                     static_cast<const void *>(loaded.value().get()));
+    }
+    else
+    {
+        Logger::info("[AssetManager] loadGLTF got empty scene for key='{}' path='{}'", key, resolved);
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(_gltfMutex);
+        _gltfCacheByPath[key] = loaded.value();
+    }
+    return loaded;
+}
+
+std::shared_ptr<MeshAsset> AssetManager::getPrimitive(std::string_view name) const
+{
+    if (name.empty()) return {};
+    auto findBy = [&](const std::string &key) -> std::shared_ptr<MeshAsset> {
+        auto it = _meshCache.find(key);
+        return (it != _meshCache.end()) ? it->second : nullptr;
+    };
+
+    if (name == std::string_view("cube") || name == std::string_view("Cube"))
+    {
+        if (auto m = findBy("cube")) return m;
+        if (auto m = findBy("Cube")) return m;
+        return {};
+    }
+    if (name == std::string_view("sphere") || name == std::string_view("Sphere"))
+    {
+        if (auto m = findBy("sphere")) return m;
+        if (auto m = findBy("Sphere")) return m;
+        return {};
+    }
+    if (name == std::string_view("plane") || name == std::string_view("Plane"))
+    {
+        if (auto m = findBy("plane")) return m;
+        if (auto m = findBy("Plane")) return m;
+        return {};
+    }
+    if (name == std::string_view("capsule") || name == std::string_view("Capsule"))
+    {
+        if (auto m = findBy("capsule")) return m;
+        if (auto m = findBy("Capsule")) return m;
+        return {};
+    }
+    return {};
+}
+
+std::shared_ptr<MeshAsset> AssetManager::createMesh(const MeshCreateInfo &info)
+{
+    if (!_engine || !_engine->_resourceManager) return {};
+    if (info.name.empty()) return {};
+
+    if (auto it = _meshCache.find(info.name); it != _meshCache.end())
+    {
+        return it->second;
+    }
+
+    std::vector<Vertex> tmpVerts;
+    std::vector<uint32_t> tmpInds;
+    std::span<Vertex> vertsSpan{};
+    std::span<uint32_t> indsSpan{};
+
+    switch (info.geometry.type)
+    {
+    case MeshGeometryDesc::Type::Provided:
+        vertsSpan = info.geometry.vertices;
+        indsSpan = info.geometry.indices;
+        break;
+    case MeshGeometryDesc::Type::Cube:
+        primitives::buildCube(tmpVerts, tmpInds);
+        vertsSpan = tmpVerts;
+        indsSpan = tmpInds;
+        break;
+    case MeshGeometryDesc::Type::Sphere:
+        primitives::buildSphere(tmpVerts, tmpInds, info.geometry.sectors, info.geometry.stacks);
+        vertsSpan = tmpVerts;
+        indsSpan = tmpInds;
+        break;
+    case MeshGeometryDesc::Type::Plane:
+        primitives::buildPlane(tmpVerts, tmpInds);
+        vertsSpan = tmpVerts;
+        indsSpan = tmpInds;
+        break;
+    case MeshGeometryDesc::Type::Capsule:
+        primitives::buildCapsule(tmpVerts, tmpInds, info.geometry.sectors, info.geometry.stacks);
+        vertsSpan = tmpVerts;
+        indsSpan = tmpInds;
+        break;
+    }
+
+    // Ensure tangents exist for primitives (and provided geometry if needed)
+    if (!tmpVerts.empty() && !tmpInds.empty())
+    {
+        geom::generate_tangents(tmpVerts, tmpInds);
+    }
+
+    std::shared_ptr<MeshAsset> mesh;
+
+    if (info.material.kind == MeshMaterialDesc::Kind::Default)
+    {
+        mesh = createMesh(info.name, vertsSpan, indsSpan, {});
+    }
+    else
+    {
+        const auto &opt = info.material.options;
+
+        GLTFMetallic_Roughness::MaterialConstants constants = opt.constants;
+
+        if (!opt.occlusionPath.empty())
+        {
+            if (constants.extra[0].y == 0.0f && constants.extra[0].z == 0.0f)
+            {
+                constants.extra[0].y = 1.0f; // AO strength
+                constants.extra[0].z = 1.0f; // hasAO flag
+            }
+        }
+
+        if (!opt.emissivePath.empty())
+        {
+            if (constants.extra[1].x == 0.0f &&
+                constants.extra[1].y == 0.0f &&
+                constants.extra[1].z == 0.0f)
+            {
+                constants.extra[1] = glm::vec4(1.0f, 1.0f, 1.0f, constants.extra[1].w);
+            }
+        }
+
+        AllocatedBuffer matBuffer = createMaterialBufferWithConstants(constants);
+
+        GLTFMetallic_Roughness::MaterialResources res{};
+        res.colorImage = _engine->_errorCheckerboardImage;
+        res.colorSampler = _engine->_samplerManager->defaultLinear();
+        res.metalRoughImage = _engine->_whiteImage;
+        res.metalRoughSampler = _engine->_samplerManager->defaultLinear();
+        res.normalImage = _engine->_flatNormalImage;
+        res.normalSampler = _engine->_samplerManager->defaultLinear();
+        res.occlusionImage = _engine->_whiteImage;
+        res.occlusionSampler = _engine->_samplerManager->defaultLinear();
+        res.emissiveImage = _engine->_blackImage;
+        res.emissiveSampler = _engine->_samplerManager->defaultLinear();
+        res.planetSpecularImage = _engine->_blackImage;
+        res.planetSpecularSampler = _engine->_samplerManager->defaultLinear();
+        res.dataBuffer = matBuffer.buffer;
+        res.dataBufferOffset = 0;
+
+        auto mat = createMaterial(opt.pass, res);
+
+        // Register dynamic texture bindings using the central TextureCache
+        if (_engine && _engine->_context && _engine->_context->textures)
+        {
+            TextureCache *cache = _engine->_context->textures;
+            auto buildKey = [&](std::string_view path, bool srgb) -> TextureCache::TextureKey {
+                TextureCache::TextureKey k{};
+                if (!path.empty())
+                {
+                    k.kind = TextureCache::TextureKey::SourceKind::FilePath;
+                    k.path = assetPath(path);
+                    k.srgb = srgb;
+                    k.mipmapped = true;
+                    std::string id = std::string("PRIM:") + k.path + (srgb ? "#sRGB" : "#UNORM");
+                    k.hash = texcache::fnv1a64(id);
+                }
+                return k;
+            };
+
+            if (!opt.albedoPath.empty())
+            {
+                auto key = buildKey(opt.albedoPath, opt.albedoSRGB);
+                if (key.hash != 0)
+                {
+                    VkSampler samp = _engine->_samplerManager->defaultLinear();
+                    auto handle = cache->request(key, samp);
+                    cache->watchBinding(handle, mat->data.materialSet, 1u, samp, _engine->_errorCheckerboardImage.imageView);
+                }
+            }
+            if (!opt.metalRoughPath.empty())
+            {
+                auto key = buildKey(opt.metalRoughPath, opt.metalRoughSRGB);
+                if (key.hash != 0)
+                {
+                    VkSampler samp = _engine->_samplerManager->defaultLinear();
+                    auto handle = cache->request(key, samp);
+                    cache->watchBinding(handle, mat->data.materialSet, 2u, samp, _engine->_whiteImage.imageView);
+                }
+            }
+            if (!opt.normalPath.empty())
+            {
+                auto key = buildKey(opt.normalPath, opt.normalSRGB);
+                if (key.hash != 0)
+                {
+                    VkSampler samp = _engine->_samplerManager->defaultLinear();
+                    auto handle = cache->request(key, samp);
+                    cache->watchBinding(handle, mat->data.materialSet, 3u, samp, _engine->_flatNormalImage.imageView);
+                }
+            }
+            if (!opt.occlusionPath.empty())
+            {
+                auto key = buildKey(opt.occlusionPath, opt.occlusionSRGB);
+                key.channels = TextureCache::TextureKey::ChannelsHint::R;
+                if (key.hash != 0)
+                {
+                    VkSampler samp = _engine->_samplerManager->defaultLinear();
+                    auto handle = cache->request(key, samp);
+                    cache->watchBinding(handle, mat->data.materialSet, 4u, samp, _engine->_whiteImage.imageView);
+                }
+            }
+            if (!opt.emissivePath.empty())
+            {
+                auto key = buildKey(opt.emissivePath, opt.emissiveSRGB);
+                if (key.hash != 0)
+                {
+                    VkSampler samp = _engine->_samplerManager->defaultLinear();
+                    auto handle = cache->request(key, samp);
+                    cache->watchBinding(handle, mat->data.materialSet, 5u, samp, _engine->_blackImage.imageView);
+                }
+            }
+        }
+
+        mesh = createMesh(info.name, vertsSpan, indsSpan, mat);
+        _meshMaterialBuffers.emplace(info.name, matBuffer);
+    }
+
+    if (!mesh)
+    {
+        return {};
+    }
+
+    // Tag primitive meshes with more appropriate default bounds types for picking,
+    // then apply any explicit override from MeshCreateInfo.
+    for (auto &surf : mesh->surfaces)
+    {
+        switch (info.geometry.type)
+        {
+        case MeshGeometryDesc::Type::Sphere:
+            surf.bounds.type = BoundsType::Sphere;
+            break;
+        case MeshGeometryDesc::Type::Capsule:
+            surf.bounds.type = BoundsType::Capsule;
+            break;
+        case MeshGeometryDesc::Type::Cube:
+            surf.bounds.type = BoundsType::Box;
+            break;
+        case MeshGeometryDesc::Type::Plane:
+            surf.bounds.type = BoundsType::Box;
+            break;
+        case MeshGeometryDesc::Type::Provided:
+        default:
+            surf.bounds.type = BoundsType::Box;
+            break;
+        }
+
+        if (info.boundsType.has_value())
+        {
+            surf.bounds.type = *info.boundsType;
+        }
+    }
+
+    return mesh;
+}
+
+AssetManager::GLTFTexturePrefetchResult AssetManager::prefetchGLTFTexturesWithHandles(std::string_view nameOrPath)
+{
+    GLTFTexturePrefetchResult result{};
+    if (!_engine || !_engine->_context || !_engine->_context->textures) return result;
+    if (nameOrPath.empty()) return result;
+
+    std::string resolved = assetPath(nameOrPath);
+    std::filesystem::path path = resolved;
+
+    fastgltf::Parser parser{};
+    constexpr auto gltfOptions = fastgltf::Options::DontRequireValidAssetMember | fastgltf::Options::AllowDouble |
+                                 fastgltf::Options::LoadGLBBuffers | fastgltf::Options::LoadExternalBuffers;
+    fastgltf::GltfDataBuffer data;
+    if (!data.loadFromFile(path)) return result;
+
+    fastgltf::Asset gltf;
+
+    auto type = fastgltf::determineGltfFileType(&data);
+    if (type == fastgltf::GltfType::glTF)
+    {
+        auto load = parser.loadGLTF(&data, path.parent_path(), gltfOptions);
+        if (load) gltf = std::move(load.get()); else return result;
+    }
+    else if (type == fastgltf::GltfType::GLB)
+    {
+        auto load = parser.loadBinaryGLTF(&data, path.parent_path(), gltfOptions);
+        if (load) gltf = std::move(load.get()); else return result;
+    }
+    else
+    {
+        return result;
+    }
+
+    TextureCache *cache = _engine->_context->textures;
+    const std::filesystem::path baseDir = path.parent_path();
+
+    auto enqueueTex = [&](size_t imgIndex, bool srgb)
+    {
+        if (imgIndex >= gltf.images.size()) return;
+        TextureCache::TextureKey key{};
+        key.srgb = srgb;
+        key.mipmapped = true;
+
+        fastgltf::Image &image = gltf.images[imgIndex];
+        std::visit(fastgltf::visitor{
+            [&](fastgltf::sources::URI &filePath)
+            {
+                const std::string rel(filePath.uri.path().begin(), filePath.uri.path().end());
+                std::filesystem::path resolvedImg = std::filesystem::path(rel);
+                if (resolvedImg.is_relative())
+                {
+                    resolvedImg = baseDir / resolvedImg;
+                }
+                key.kind = TextureCache::TextureKey::SourceKind::FilePath;
+                key.path = resolvedImg.string();
+                std::string id = std::string("GLTF:") + key.path + (srgb ? "#sRGB" : "#UNORM");
+                key.hash = texcache::fnv1a64(id);
+            },
+            [&](fastgltf::sources::Vector &vector)
+            {
+                key.kind = TextureCache::TextureKey::SourceKind::Bytes;
+                key.bytes.assign(vector.bytes.begin(), vector.bytes.end());
+                uint64_t h = texcache::fnv1a64(key.bytes.data(), key.bytes.size());
+                key.hash = h ^ (srgb ? 0x9E3779B97F4A7C15ull : 0ull);
+            },
+            [&](fastgltf::sources::BufferView &view)
+            {
+                auto &bufferView = gltf.bufferViews[view.bufferViewIndex];
+                auto &buffer = gltf.buffers[bufferView.bufferIndex];
+                std::visit(fastgltf::visitor{
+                    [](auto &) {},
+                    [&](fastgltf::sources::Vector &vec)
+                    {
+                        size_t off = bufferView.byteOffset;
+                        size_t len = bufferView.byteLength;
+                        key.kind = TextureCache::TextureKey::SourceKind::Bytes;
+                        key.bytes.assign(vec.bytes.begin() + off, vec.bytes.begin() + off + len);
+                        uint64_t h = texcache::fnv1a64(key.bytes.data(), key.bytes.size());
+                        key.hash = h ^ (srgb ? 0x9E3779B97F4A7C15ull : 0ull);
+                    }
+                }, buffer.data);
+            },
+            [](auto &) {}
+        }, image.data);
+
+        if (key.hash != 0)
+        {
+            VkSampler samp = _engine->_samplerManager->defaultLinear();
+            TextureCache::TextureHandle handle = cache->request(key, samp);
+            result.handles.push_back(handle);
+            result.scheduled++;
+        }
+    };
+
+    for (const auto &tex : gltf.textures)
+    {
+        if (tex.imageIndex.has_value())
+        {
+            // For baseColor we prefer sRGB; other maps requested later will reuse entry
+            enqueueTex(tex.imageIndex.value(), true);
+        }
+    }
+
+    // Proactively free big buffer vectors we no longer need.
+    for (auto &buf : gltf.buffers)
+    {
+        std::visit(fastgltf::visitor{
+            [](auto &) {},
+            [&](fastgltf::sources::Vector &vec) {
+                std::vector<uint8_t>().swap(vec.bytes);
+            }
+        }, buf.data);
+    }
+
+    return result;
+}
+
+size_t AssetManager::prefetchGLTFTextures(std::string_view nameOrPath)
+{
+    return prefetchGLTFTexturesWithHandles(nameOrPath).scheduled;
+}
+
+static Bounds compute_bounds(std::span<Vertex> vertices)
+{
+    Bounds b{};
+    if (vertices.empty())
+    {
+        b.origin = glm::vec3(0.0f);
+        b.extents = glm::vec3(0.5f);
+        b.sphereRadius = glm::length(b.extents);
+        b.type = BoundsType::Box;
+        return b;
+    }
+    glm::vec3 minpos = vertices[0].position;
+    glm::vec3 maxpos = vertices[0].position;
+    for (const auto &v: vertices)
+    {
+        minpos = glm::min(minpos, v.position);
+        maxpos = glm::max(maxpos, v.position);
+    }
+    b.origin = (maxpos + minpos) / 2.f;
+    b.extents = (maxpos - minpos) / 2.f;
+    b.sphereRadius = glm::length(b.extents);
+    b.type = BoundsType::Box;
+    return b;
+}
+
+AllocatedBuffer AssetManager::createMaterialBufferWithConstants(
+    const GLTFMetallic_Roughness::MaterialConstants &constants) const
+{
+    AllocatedBuffer matBuffer = _engine->_resourceManager->create_buffer(
+        sizeof(GLTFMetallic_Roughness::MaterialConstants),
+        VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
+        VMA_MEMORY_USAGE_CPU_TO_GPU);
+
+    VmaAllocationInfo allocInfo{};
+    vmaGetAllocationInfo(_engine->_deviceManager->allocator(), matBuffer.allocation, &allocInfo);
+    auto *matConstants = (GLTFMetallic_Roughness::MaterialConstants *) allocInfo.pMappedData;
+    *matConstants = constants;
+    if (matConstants->colorFactors == glm::vec4(0))
+    {
+        matConstants->colorFactors = glm::vec4(1.0f);
+    }
+    if (matConstants->extra[0].x == 0.0f)
+    {
+        matConstants->extra[0].x = 1.0f; // normal scale default
+    }
+    // Ensure writes are visible on non-coherent memory
+    vmaFlushAllocation(_engine->_deviceManager->allocator(), matBuffer.allocation, 0,
+                       sizeof(GLTFMetallic_Roughness::MaterialConstants));
+    return matBuffer;
+}
+
+std::shared_ptr<GLTFMaterial> AssetManager::createMaterial(
+    MaterialPass pass, const GLTFMetallic_Roughness::MaterialResources &res) const
+{
+    auto mat = std::make_shared<GLTFMaterial>();
+    mat->data = _engine->metalRoughMaterial.write_material(
+        _engine->_deviceManager->device(), pass, res, *_engine->_context->descriptors);
+    return mat;
+}
+
+std::pair<AllocatedImage, bool> AssetManager::loadImageFromAsset(std::string_view imgPath, bool srgb) const
+{
+    AllocatedImage out{};
+    bool created = false;
+    if (!imgPath.empty())
+    {
+        std::string resolved = assetPath(imgPath);
+        int w = 0, h = 0, comp = 0;
+        stbi_uc *pixels = stbi_load(resolved.c_str(), &w, &h, &comp, 4);
+        if (pixels && w > 0 && h > 0)
+        {
+            VkFormat fmt = srgb ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+            out = _engine->_resourceManager->create_image(pixels,
+                                                          VkExtent3D{static_cast<uint32_t>(w), static_cast<uint32_t>(h), 1},
+                                                          fmt,
+                                                          VK_IMAGE_USAGE_SAMPLED_BIT,
+                                                          false);
+            created = true;
+        }
+        else
+        {
+            Logger::error("[AssetManager] Failed to load texture '{}' (resolved='{}')",
+                         imgPath,
+                         resolved);
+        }
+        if (pixels) stbi_image_free(pixels);
+    }
+    return {out, created};
+}
+
+std::shared_ptr<MeshAsset> AssetManager::createMesh(const std::string &name,
+                                                    std::span<Vertex> vertices,
+                                                    std::span<uint32_t> indices,
+                                                    std::shared_ptr<GLTFMaterial> material,
+                                                    bool build_bvh)
+{
+    if (!_engine || !_engine->_resourceManager) return {};
+    if (name.empty()) return {};
+
+    auto it = _meshCache.find(name);
+    if (it != _meshCache.end()) return it->second;
+
+    if (!material)
+    {
+        GLTFMetallic_Roughness::MaterialResources matResources{};
+        matResources.colorImage = _engine->_whiteImage;
+        matResources.colorSampler = _engine->_samplerManager->defaultLinear();
+        matResources.metalRoughImage = _engine->_whiteImage;
+        matResources.metalRoughSampler = _engine->_samplerManager->defaultLinear();
+        matResources.normalImage = _engine->_flatNormalImage;
+        matResources.normalSampler = _engine->_samplerManager->defaultLinear();
+        matResources.occlusionImage = _engine->_whiteImage;
+        matResources.occlusionSampler = _engine->_samplerManager->defaultLinear();
+        matResources.emissiveImage = _engine->_blackImage;
+        matResources.emissiveSampler = _engine->_samplerManager->defaultLinear();
+        matResources.planetSpecularImage = _engine->_blackImage;
+        matResources.planetSpecularSampler = _engine->_samplerManager->defaultLinear();
+
+        AllocatedBuffer matBuffer = createMaterialBufferWithConstants({});
+        matResources.dataBuffer = matBuffer.buffer;
+        matResources.dataBufferOffset = 0;
+
+        material = createMaterial(MaterialPass::MainColor, matResources);
+        _meshMaterialBuffers.emplace(name, matBuffer);
+    }
+
+    auto mesh = std::make_shared<MeshAsset>();
+    mesh->name = name;
+    mesh->meshBuffers = _engine->_resourceManager->uploadMesh(indices, vertices);
+    // BLAS for this mesh is built lazily when TLAS is constructed from the draw
+    // context (RayTracingManager::buildTLASFromDrawContext). This keeps RT work
+    // centralized and avoids redundant builds on load.
+
+    GeoSurface surf{};
+    surf.startIndex = 0;
+    surf.count = (uint32_t) indices.size();
+    surf.material = material;
+    surf.bounds = compute_bounds(vertices);
+    mesh->surfaces.push_back(surf);
+
+    if (build_bvh)
+    {
+        // Build CPU-side BVH for precise ray picking over this mesh.
+        // This uses the same mesh-local vertex/index data as the GPU upload.
+        mesh->bvh = build_mesh_bvh(*mesh, vertices, indices);
+    }
+
+    _meshCache.emplace(name, mesh);
+    return mesh;
+}
+
+std::shared_ptr<GLTFMaterial> AssetManager::createMaterialFromConstants(
+    const std::string &name,
+    const GLTFMetallic_Roughness::MaterialConstants &constants,
+    MaterialPass pass)
+{
+    if (!_engine) return {};
+    GLTFMetallic_Roughness::MaterialResources res{};
+    res.colorImage = _engine->_whiteImage;
+    res.colorSampler = _engine->_samplerManager->defaultLinear();
+    res.metalRoughImage = _engine->_whiteImage;
+    res.metalRoughSampler = _engine->_samplerManager->defaultLinear();
+    res.normalImage = _engine->_flatNormalImage;
+    res.normalSampler = _engine->_samplerManager->defaultLinear();
+    res.occlusionImage = _engine->_whiteImage;
+    res.occlusionSampler = _engine->_samplerManager->defaultLinear();
+    res.emissiveImage = _engine->_blackImage;
+    res.emissiveSampler = _engine->_samplerManager->defaultLinear();
+    res.planetSpecularImage = _engine->_blackImage;
+    res.planetSpecularSampler = _engine->_samplerManager->defaultLinear();
+
+    AllocatedBuffer buf = createMaterialBufferWithConstants(constants);
+    res.dataBuffer = buf.buffer;
+    res.dataBufferOffset = 0;
+    _meshMaterialBuffers[name] = buf;
+
+    return createMaterial(pass, res);
+}
+
+bool AssetManager::createOrUpdateMeshVfxMaterial(const std::string &name, const MeshVfxMaterialSettings &settings)
+{
+    if (!_engine || !_engine->_resourceManager || !_engine->_samplerManager || !_engine->_deviceManager)
+    {
+        return false;
+    }
+    if (name.empty())
+    {
+        return false;
+    }
+
+    MeshVfxMaterialSettings clamped = settings;
+    clamped.opacity = std::clamp(clamped.opacity, 0.0f, 1.0f);
+    clamped.fresnelPower = std::max(clamped.fresnelPower, 0.001f);
+    clamped.fresnelStrength = std::max(clamped.fresnelStrength, 0.0f);
+    clamped.tint = glm::max(clamped.tint, glm::vec3(0.0f));
+    clamped.distortionStrength = std::max(clamped.distortionStrength, 0.0f);
+    clamped.noiseBlend = std::clamp(clamped.noiseBlend, 0.0f, 1.0f);
+    clamped.gradientAxis = std::clamp(clamped.gradientAxis, 0.0f, 1.0f);
+    clamped.gradientStart = std::clamp(clamped.gradientStart, 0.0f, 1.0f);
+    clamped.gradientEnd = std::clamp(clamped.gradientEnd, 0.0f, 1.0f);
+    clamped.emissionStrength = std::max(clamped.emissionStrength, 0.0f);
+    clamped.coreColor = glm::max(clamped.coreColor, glm::vec3(0.0f));
+    clamped.edgeColor = glm::max(clamped.edgeColor, glm::vec3(0.0f));
+
+    GLTFMetallic_Roughness::MaterialConstants constants{};
+    constants.colorFactors = glm::vec4(1.0f);
+    constants.metal_rough_factors = glm::vec4(0.0f, 1.0f, 0.0f, 0.0f);
+    constants.extra[0].x = 1.0f;
+    constants.extra[3].x = clamped.opacity;
+    constants.extra[3].y = clamped.fresnelPower;
+    constants.extra[3].z = clamped.fresnelStrength;
+    constants.extra[4] = glm::vec4(clamped.tint, 0.0f);
+    constants.extra[5] = glm::vec4(clamped.scrollVelocity1, clamped.scrollVelocity2);
+    constants.extra[6] = glm::vec4(clamped.distortionStrength, clamped.noiseBlend, clamped.gradientAxis, clamped.emissionStrength);
+    constants.extra[7] = glm::vec4(clamped.coreColor, clamped.gradientStart);
+    constants.extra[8] = glm::vec4(clamped.edgeColor, clamped.gradientEnd);
+
+    auto patch_texture_watches = [&](const std::shared_ptr<GLTFMaterial> &materialPtr) {
+        if (!_engine->_textureCache || !materialPtr)
+        {
+            return;
+        }
+        _engine->_textureCache->unwatchSet(materialPtr->data.materialSet);
+
+        auto watchVfxBinding = [&](const std::string &path, bool srgb, uint32_t binding, VkImageView fallback) {
+            if (path.empty()) return;
+            TextureCache::TextureKey key{};
+            key.kind = TextureCache::TextureKey::SourceKind::FilePath;
+            key.path = assetPath(path);
+            key.srgb = srgb;
+            key.mipmapped = true;
+            std::string id = std::string("VFX:") + key.path + (key.srgb ? "#sRGB" : "#UNORM");
+            key.hash = texcache::fnv1a64(id);
+            VkSampler sampler = _engine->_samplerManager->defaultLinear();
+            auto handle = _engine->_textureCache->request(key, sampler);
+            _engine->_textureCache->watchBinding(handle,
+                                                 materialPtr->data.materialSet,
+                                                 binding,
+                                                 sampler,
+                                                 fallback);
+        };
+
+        watchVfxBinding(clamped.albedoPath, clamped.albedoSRGB, 1u, _engine->_whiteImage.imageView);
+        watchVfxBinding(clamped.noise1Path, clamped.noise1SRGB, 2u, _engine->_whiteImage.imageView);
+        watchVfxBinding(clamped.noise2Path, clamped.noise2SRGB, 3u, _engine->_flatNormalImage.imageView);
+    };
+
+    auto it = _meshVfxMaterials.find(name);
+    if (it != _meshVfxMaterials.end())
+    {
+        MeshVfxMaterialRecord &rec = it->second;
+        if (rec.constantsBuffer.buffer == VK_NULL_HANDLE || rec.material == nullptr)
+        {
+            return false;
+        }
+
+        VmaAllocationInfo allocInfo{};
+        vmaGetAllocationInfo(_engine->_deviceManager->allocator(), rec.constantsBuffer.allocation, &allocInfo);
+        auto *dst = static_cast<GLTFMetallic_Roughness::MaterialConstants *>(allocInfo.pMappedData);
+        if (!dst)
+        {
+            return false;
+        }
+        *dst = constants;
+        vmaFlushAllocation(_engine->_deviceManager->allocator(),
+                           rec.constantsBuffer.allocation,
+                           0,
+                           sizeof(GLTFMetallic_Roughness::MaterialConstants));
+
+        rec.settings = clamped;
+        patch_texture_watches(rec.material);
+        return true;
+    }
+
+    GLTFMetallic_Roughness::MaterialResources res{};
+    res.colorImage = _engine->_whiteImage;
+    res.colorSampler = _engine->_samplerManager->defaultLinear();
+    res.metalRoughImage = _engine->_whiteImage;
+    res.metalRoughSampler = _engine->_samplerManager->defaultLinear();
+    res.normalImage = _engine->_flatNormalImage;
+    res.normalSampler = _engine->_samplerManager->defaultLinear();
+    res.occlusionImage = _engine->_whiteImage;
+    res.occlusionSampler = _engine->_samplerManager->defaultLinear();
+    res.emissiveImage = _engine->_blackImage;
+    res.emissiveSampler = _engine->_samplerManager->defaultLinear();
+    res.planetSpecularImage = _engine->_blackImage;
+    res.planetSpecularSampler = _engine->_samplerManager->defaultLinear();
+
+    AllocatedBuffer constantsBuffer = createMaterialBufferWithConstants(constants);
+    res.dataBuffer = constantsBuffer.buffer;
+    res.dataBufferOffset = 0;
+
+    auto mat = createMaterial(MaterialPass::MeshVFX, res);
+    if (!mat)
+    {
+        _engine->_resourceManager->destroy_buffer(constantsBuffer);
+        return false;
+    }
+
+    MeshVfxMaterialRecord rec{};
+    rec.settings = clamped;
+    rec.material = mat;
+    rec.constantsBuffer = constantsBuffer;
+    _meshVfxMaterials.emplace(name, std::move(rec));
+    patch_texture_watches(mat);
+    return true;
+}
+
+bool AssetManager::removeMeshVfxMaterial(const std::string &name)
+{
+    auto it = _meshVfxMaterials.find(name);
+    if (it == _meshVfxMaterials.end())
+    {
+        return false;
+    }
+    if (it->second.material && it->second.material.use_count() > 1)
+    {
+        // In use by one or more meshes.
+        return false;
+    }
+    if (_engine && _engine->_textureCache && it->second.material)
+    {
+        _engine->_textureCache->unwatchSet(it->second.material->data.materialSet);
+    }
+    if (_engine && _engine->_resourceManager && it->second.constantsBuffer.buffer != VK_NULL_HANDLE)
+    {
+        _engine->_resourceManager->destroy_buffer(it->second.constantsBuffer);
+    }
+    _meshVfxMaterials.erase(it);
+    return true;
+}
+
+bool AssetManager::getMeshVfxMaterialSettings(const std::string &name, MeshVfxMaterialSettings &out) const
+{
+    auto it = _meshVfxMaterials.find(name);
+    if (it == _meshVfxMaterials.end())
+    {
+        return false;
+    }
+    out = it->second.settings;
+    return true;
+}
+
+std::shared_ptr<GLTFMaterial> AssetManager::getMeshVfxMaterial(const std::string &name) const
+{
+    auto it = _meshVfxMaterials.find(name);
+    if (it == _meshVfxMaterials.end())
+    {
+        return {};
+    }
+    return it->second.material;
+}
+
+bool AssetManager::createOrUpdateBlackbodyMaterial(const std::string &name, const BlackbodyMaterialSettings &settings)
+{
+    if (!_engine || !_engine->_resourceManager || !_engine->_samplerManager || !_engine->_deviceManager)
+    {
+        return false;
+    }
+    if (name.empty())
+    {
+        return false;
+    }
+
+    BlackbodyMaterialSettings clamped = settings;
+    clamped.metallic = std::clamp(clamped.metallic, 0.0f, 1.0f);
+    clamped.roughness = std::clamp(clamped.roughness, 0.04f, 1.0f);
+    clamped.normalScale = std::max(clamped.normalScale, 0.0f);
+    clamped.occlusionStrength = std::clamp(clamped.occlusionStrength, 0.0f, 1.0f);
+    clamp_blackbody_settings(clamped.blackbody);
+
+    const bool bb_enabled =
+        (!clamped.blackbody.noisePath.empty()) &&
+        (clamped.blackbody.intensity > 0.0f) &&
+        (clamped.blackbody.tempMaxK > clamped.blackbody.tempMinK);
+
+    GLTFMetallic_Roughness::MaterialConstants constants{};
+    constants.colorFactors = clamped.colorFactor;
+    constants.metal_rough_factors = glm::vec4(clamped.metallic, clamped.roughness, 0.0f, 0.0f);
+    constants.extra[0].x = clamped.normalScale;
+
+    if (!clamped.occlusionPath.empty())
+    {
+        constants.extra[0].y = clamped.occlusionStrength;
+        constants.extra[0].z = 1.0f;
+    }
+
+    // Disable standard emissive; when blackbody is enabled, emissiveTex is repurposed as noise.
+    constants.extra[1] = glm::vec4(0.0f);
+
+    constants.extra[9] = glm::vec4(bb_enabled ? 1.0f : 0.0f,
+                                   clamped.blackbody.intensity,
+                                   clamped.blackbody.tempMinK,
+                                   clamped.blackbody.tempMaxK);
+    constants.extra[10] = glm::vec4(clamped.blackbody.noiseScale,
+                                    clamped.blackbody.noiseContrast,
+                                    clamped.blackbody.noiseScroll.x,
+                                    clamped.blackbody.noiseScroll.y);
+    constants.extra[11] = glm::vec4(clamped.blackbody.heatAxisLocal,
+                                    clamped.blackbody.hotEndBias);
+    constants.extra[12] = glm::vec4(clamped.blackbody.noiseSpeed, 0.0f, 0.0f, 0.0f);
+    constants.extra[13] = glm::vec4(clamped.blackbody.hotRangeStart,
+                                    clamped.blackbody.hotRangeEnd,
+                                    0.0f,
+                                    0.0f);
+
+    auto patch_texture_watches = [&](const std::shared_ptr<GLTFMaterial> &materialPtr) {
+        if (!_engine->_textureCache || !materialPtr)
+        {
+            return;
+        }
+
+        VkDescriptorSet set = materialPtr->data.materialSet;
+        if (set == VK_NULL_HANDLE)
+        {
+            return;
+        }
+
+        _engine->_textureCache->unwatchSet(set);
+
+        auto watchBindingPath = [&](const std::string &path,
+                                    bool srgb,
+                                    uint32_t binding,
+                                    VkImageView fallback,
+                                    TextureCache::TextureKey::ChannelsHint channels = TextureCache::TextureKey::ChannelsHint::Auto)
+        {
+            if (path.empty()) return;
+
+            TextureCache::TextureKey key{};
+            key.kind = TextureCache::TextureKey::SourceKind::FilePath;
+            key.path = assetPath(path);
+            key.srgb = srgb;
+            key.mipmapped = true;
+            key.channels = channels;
+
+            std::string id = std::string("BB:") + key.path + (key.srgb ? "#sRGB" : "#UNORM");
+            key.hash = texcache::fnv1a64(id);
+
+            VkSampler sampler = _engine->_samplerManager->defaultLinear();
+            auto handle = _engine->_textureCache->request(key, sampler);
+            _engine->_textureCache->watchBinding(handle, set, binding, sampler, fallback);
+        };
+
+        const bool wantAlbedo = !clamped.albedoPath.empty();
+        const VkImageView albedoFallback = wantAlbedo ? _engine->_errorCheckerboardImage.imageView : _engine->_whiteImage.imageView;
+        watchBindingPath(clamped.albedoPath, clamped.albedoSRGB, 1u, albedoFallback);
+
+        watchBindingPath(clamped.metalRoughPath, clamped.metalRoughSRGB, 2u, _engine->_whiteImage.imageView);
+
+        watchBindingPath(clamped.normalPath, clamped.normalSRGB, 3u, _engine->_flatNormalImage.imageView,
+                         TextureCache::TextureKey::ChannelsHint::RG);
+
+        watchBindingPath(clamped.occlusionPath, clamped.occlusionSRGB, 4u, _engine->_whiteImage.imageView,
+                         TextureCache::TextureKey::ChannelsHint::R);
+
+        VkSampler sampler = _engine->_samplerManager->defaultLinear();
+        if (bb_enabled)
+        {
+            // Noise is always treated as linear.
+            TextureCache::TextureKey key{};
+            key.kind = TextureCache::TextureKey::SourceKind::FilePath;
+            key.path = assetPath(clamped.blackbody.noisePath);
+            key.srgb = false;
+            key.mipmapped = true;
+            std::string id = std::string("BB_NOISE:") + key.path + "#UNORM";
+            key.hash = texcache::fnv1a64(id);
+
+            auto handle = _engine->_textureCache->request(key, sampler);
+            _engine->_textureCache->watchBindingReplace(handle, set, 5u, sampler, _engine->_blackImage.imageView);
+        }
+        else
+        {
+            // Clear any existing watch and force emissiveTex to black.
+            _engine->_textureCache->watchBindingReplace(TextureCache::InvalidHandle, set, 5u, sampler,
+                                                       _engine->_blackImage.imageView);
+        }
+    };
+
+    auto it = _blackbodyMaterials.find(name);
+    if (it != _blackbodyMaterials.end())
+    {
+        BlackbodyMaterialRecord &rec = it->second;
+        if (rec.constantsBuffer.buffer == VK_NULL_HANDLE || rec.material == nullptr)
+        {
+            return false;
+        }
+
+        VmaAllocationInfo allocInfo{};
+        vmaGetAllocationInfo(_engine->_deviceManager->allocator(), rec.constantsBuffer.allocation, &allocInfo);
+        auto *dst = static_cast<GLTFMetallic_Roughness::MaterialConstants *>(allocInfo.pMappedData);
+        if (!dst)
+        {
+            return false;
+        }
+        *dst = constants;
+        vmaFlushAllocation(_engine->_deviceManager->allocator(),
+                           rec.constantsBuffer.allocation,
+                           0,
+                           sizeof(GLTFMetallic_Roughness::MaterialConstants));
+
+        rec.settings = clamped;
+        patch_texture_watches(rec.material);
+        return true;
+    }
+
+    GLTFMetallic_Roughness::MaterialResources res{};
+    res.colorImage = clamped.albedoPath.empty() ? _engine->_whiteImage : _engine->_errorCheckerboardImage;
+    res.colorSampler = _engine->_samplerManager->defaultLinear();
+    res.metalRoughImage = _engine->_whiteImage;
+    res.metalRoughSampler = _engine->_samplerManager->defaultLinear();
+    res.normalImage = _engine->_flatNormalImage;
+    res.normalSampler = _engine->_samplerManager->defaultLinear();
+    res.occlusionImage = _engine->_whiteImage;
+    res.occlusionSampler = _engine->_samplerManager->defaultLinear();
+    res.emissiveImage = _engine->_blackImage;
+    res.emissiveSampler = _engine->_samplerManager->defaultLinear();
+    res.planetSpecularImage = _engine->_blackImage;
+    res.planetSpecularSampler = _engine->_samplerManager->defaultLinear();
+
+    AllocatedBuffer constantsBuffer = createMaterialBufferWithConstants(constants);
+    res.dataBuffer = constantsBuffer.buffer;
+    res.dataBufferOffset = 0;
+
+    auto mat = createMaterial(MaterialPass::MainColor, res);
+    if (!mat)
+    {
+        _engine->_resourceManager->destroy_buffer(constantsBuffer);
+        return false;
+    }
+
+    BlackbodyMaterialRecord rec{};
+    rec.settings = clamped;
+    rec.material = mat;
+    rec.constantsBuffer = constantsBuffer;
+    _blackbodyMaterials.emplace(name, std::move(rec));
+    patch_texture_watches(mat);
+    return true;
+}
+
+bool AssetManager::removeBlackbodyMaterial(const std::string &name)
+{
+    auto it = _blackbodyMaterials.find(name);
+    if (it == _blackbodyMaterials.end())
+    {
+        return false;
+    }
+    if (it->second.material && it->second.material.use_count() > 1)
+    {
+        // In use by one or more meshes.
+        return false;
+    }
+    if (_engine && _engine->_textureCache && it->second.material)
+    {
+        _engine->_textureCache->unwatchSet(it->second.material->data.materialSet);
+    }
+    if (_engine && _engine->_resourceManager && it->second.constantsBuffer.buffer != VK_NULL_HANDLE)
+    {
+        _engine->_resourceManager->destroy_buffer(it->second.constantsBuffer);
+    }
+    _blackbodyMaterials.erase(it);
+    return true;
+}
+
+bool AssetManager::getBlackbodyMaterialSettings(const std::string &name, BlackbodyMaterialSettings &out) const
+{
+    auto it = _blackbodyMaterials.find(name);
+    if (it == _blackbodyMaterials.end())
+    {
+        return false;
+    }
+    out = it->second.settings;
+    return true;
+}
+
+std::shared_ptr<GLTFMaterial> AssetManager::getBlackbodyMaterial(const std::string &name) const
+{
+    auto it = _blackbodyMaterials.find(name);
+    if (it == _blackbodyMaterials.end())
+    {
+        return {};
+    }
+    return it->second.material;
+}
+
+bool AssetManager::applyBlackbodyToGLTFMaterial(LoadedGLTF &scene,
+                                                const std::string &materialName,
+                                                const BlackbodySettings &settings)
+{
+    if (!_engine || !_engine->_deviceManager || !_engine->_samplerManager)
+    {
+        return false;
+    }
+    if (materialName.empty())
+    {
+        return false;
+    }
+    auto it = scene.materials.find(materialName);
+    if (it == scene.materials.end() || !it->second)
+    {
+        return false;
+    }
+    if (scene.materialDataBuffer.buffer == VK_NULL_HANDLE || !scene.materialDataBuffer.info.pMappedData)
+    {
+        return false;
+    }
+
+    auto *materials = static_cast<GLTFMetallic_Roughness::MaterialConstants *>(scene.materialDataBuffer.info.pMappedData);
+    const uint32_t idx = it->second->constants_index;
+
+    BlackbodySettings clamped = settings;
+    clamp_blackbody_settings(clamped);
+
+    const bool bb_enabled =
+        (!clamped.noisePath.empty()) &&
+        (clamped.intensity > 0.0f) &&
+        (clamped.tempMaxK > clamped.tempMinK);
+
+    GLTFMetallic_Roughness::MaterialConstants &c = materials[idx];
+    c.extra[9] = glm::vec4(bb_enabled ? 1.0f : 0.0f,
+                           clamped.intensity,
+                           clamped.tempMinK,
+                           clamped.tempMaxK);
+    c.extra[10] = glm::vec4(clamped.noiseScale,
+                            clamped.noiseContrast,
+                            clamped.noiseScroll.x,
+                            clamped.noiseScroll.y);
+    c.extra[11] = glm::vec4(clamped.heatAxisLocal,
+                            clamped.hotEndBias);
+    c.extra[12] = glm::vec4(clamped.noiseSpeed, 0.0f, 0.0f, 0.0f);
+    c.extra[13] = glm::vec4(clamped.hotRangeStart,
+                            clamped.hotRangeEnd,
+                            0.0f,
+                            0.0f);
+    // Avoid sampling the noise texture as emissive when blackbody is disabled.
+    c.extra[1].x = 0.0f;
+    c.extra[1].y = 0.0f;
+    c.extra[1].z = 0.0f;
+
+    VkDeviceSize offset = static_cast<VkDeviceSize>(idx) * sizeof(GLTFMetallic_Roughness::MaterialConstants);
+    vmaFlushAllocation(_engine->_deviceManager->allocator(),
+                       scene.materialDataBuffer.allocation,
+                       offset,
+                       sizeof(GLTFMetallic_Roughness::MaterialConstants));
+
+    if (!_engine->_textureCache || it->second->data.materialSet == VK_NULL_HANDLE)
+    {
+        return true;
+    }
+
+    VkDescriptorSet set = it->second->data.materialSet;
+    VkSampler sampler = _engine->_samplerManager->defaultLinear();
+
+    if (bb_enabled)
+    {
+        TextureCache::TextureKey key{};
+        key.kind = TextureCache::TextureKey::SourceKind::FilePath;
+        key.path = assetPath(clamped.noisePath);
+        key.srgb = false;
+        key.mipmapped = true;
+        std::string id = std::string("BB_NOISE:") + key.path + "#UNORM";
+        key.hash = texcache::fnv1a64(id);
+
+        auto handle = _engine->_textureCache->request(key, sampler);
+        _engine->_textureCache->watchBindingReplace(handle, set, 5u, sampler, _engine->_blackImage.imageView);
+    }
+    else
+    {
+        _engine->_textureCache->watchBindingReplace(TextureCache::InvalidHandle, set, 5u, sampler,
+                                                   _engine->_blackImage.imageView);
+    }
+
+    return true;
+}
+
+VkImageView AssetManager::fallbackCheckerboardView() const
+{
+    return (_engine) ? _engine->_errorCheckerboardImage.imageView : VK_NULL_HANDLE;
+}
+
+VkImageView AssetManager::fallbackWhiteView() const
+{
+    return (_engine) ? _engine->_whiteImage.imageView : VK_NULL_HANDLE;
+}
+
+VkImageView AssetManager::fallbackFlatNormalView() const
+{
+    return (_engine) ? _engine->_flatNormalImage.imageView : VK_NULL_HANDLE;
+}
+
+VkImageView AssetManager::fallbackBlackView() const
+{
+    return (_engine) ? _engine->_blackImage.imageView : VK_NULL_HANDLE;
+}
+
+std::shared_ptr<MeshAsset> AssetManager::getMesh(const std::string &name) const
+{
+    auto it = _meshCache.find(name);
+    return (it != _meshCache.end()) ? it->second : nullptr;
+}
+
+bool AssetManager::removeMaterialBuffer(const std::string &name, DeletionQueue *dq)
+{
+    auto it = _meshMaterialBuffers.find(name);
+    if (it == _meshMaterialBuffers.end() || !_engine || !_engine->_resourceManager) return false;
+    ResourceManager *rm = _engine->_resourceManager.get();
+    const AllocatedBuffer buffer = it->second;
+    _meshMaterialBuffers.erase(it);
+    if (dq) dq->push_function([rm, buffer]() { rm->destroy_buffer(buffer); });
+    else rm->destroy_buffer(buffer);
+    return true;
+}
+
+bool AssetManager::removeMesh(const std::string &name)
+{
+    auto it = _meshCache.find(name);
+    if (it == _meshCache.end()) return false;
+    if (_engine && _engine->_rayManager)
+    {
+        // Clean up BLAS cached for this mesh (if ray tracing is enabled)
+        _engine->_rayManager->removeBLASForBuffer(it->second->meshBuffers.vertexBuffer.buffer);
+    }
+    if (_engine && _engine->_resourceManager)
+    {
+        _engine->_resourceManager->destroy_buffer(it->second->meshBuffers.indexBuffer);
+        _engine->_resourceManager->destroy_buffer(it->second->meshBuffers.vertexBuffer);
+    }
+    _meshCache.erase(it);
+    auto itb = _meshMaterialBuffers.find(name);
+    if (itb != _meshMaterialBuffers.end())
+    {
+        if (_engine && _engine->_resourceManager)
+        {
+            _engine->_resourceManager->destroy_buffer(itb->second);
+        }
+        _meshMaterialBuffers.erase(itb);
+    }
+    auto iti = _meshOwnedImages.find(name);
+    if (iti != _meshOwnedImages.end())
+    {
+        if (_engine && _engine->_resourceManager)
+        {
+            for (const auto &img: iti->second)
+            {
+                _engine->_resourceManager->destroy_image(img);
+            }
+        }
+        _meshOwnedImages.erase(iti);
+    }
+    return true;
+}
+
+bool AssetManager::removeMeshDeferred(const std::string &name, DeletionQueue &dq)
+{
+    auto it = _meshCache.find(name);
+    if (it == _meshCache.end()) return false;
+
+    const std::shared_ptr<MeshAsset> mesh = it->second;
+    if (!mesh) return false;
+
+    // Remove from cache immediately so callers won't retrieve a mesh we plan to destroy.
+    _meshCache.erase(it);
+
+    if (_engine && _engine->_rayManager)
+    {
+        // Clean up BLAS cached for this mesh (if ray tracing is enabled).
+        // RayTracingManager defers actual AS destruction internally.
+        _engine->_rayManager->removeBLASForBuffer(mesh->meshBuffers.vertexBuffer.buffer);
+    }
+
+    ResourceManager *rm = (_engine && _engine->_resourceManager) ? _engine->_resourceManager.get() : nullptr;
+    if (!rm)
+    {
+        return true;
+    }
+
+    const AllocatedBuffer indexBuffer = mesh->meshBuffers.indexBuffer;
+    const AllocatedBuffer vertexBuffer = mesh->meshBuffers.vertexBuffer;
+
+    std::optional<AllocatedBuffer> materialBuffer;
+    auto itb = _meshMaterialBuffers.find(name);
+    if (itb != _meshMaterialBuffers.end())
+    {
+        materialBuffer = itb->second;
+        _meshMaterialBuffers.erase(itb);
+    }
+
+    std::vector<AllocatedImage> ownedImages;
+    auto iti = _meshOwnedImages.find(name);
+    if (iti != _meshOwnedImages.end())
+    {
+        ownedImages = std::move(iti->second);
+        _meshOwnedImages.erase(iti);
+    }
+
+    dq.push_function([rm, indexBuffer, vertexBuffer, materialBuffer, ownedImages = std::move(ownedImages)]() mutable
+    {
+        if (indexBuffer.buffer) rm->destroy_buffer(indexBuffer);
+        if (vertexBuffer.buffer) rm->destroy_buffer(vertexBuffer);
+
+        if (materialBuffer.has_value() && materialBuffer->buffer)
+        {
+            rm->destroy_buffer(*materialBuffer);
+        }
+
+        for (const auto &img : ownedImages)
+        {
+            if (img.image) rm->destroy_image(img);
+        }
+    });
+
+    return true;
+}

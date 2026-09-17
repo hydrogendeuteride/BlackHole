@@ -1,0 +1,124 @@
+// Maximum number of shadow cascades supported in shaders
+#define MAX_CASCADES 4
+// Maximum number of analytic planet occluders for directional sun shadows
+#define MAX_PLANET_OCCLUDERS 4
+// Maximum number of punctual (point) lights
+#define MAX_PUNCTUAL_LIGHTS 64
+// Maximum number of spot lights
+#define MAX_SPOT_LIGHTS 32
+// Punctual shadow-map budgets
+#define MAX_SHADOWED_SPOT_LIGHTS 8
+#define MAX_SHADOWED_POINT_LIGHTS 4
+#define POINT_SHADOW_FACE_COUNT 6
+#define MAX_POINT_SHADOW_FACES (MAX_SHADOWED_POINT_LIGHTS * POINT_SHADOW_FACE_COUNT)
+
+struct GPUPunctualLight {
+    vec4 position_radius;
+    vec4 color_intensity;
+};
+
+struct GPUSpotLight {
+    vec4 position_radius;      // xyz: position, w: radius
+    vec4 direction_cos_outer;  // xyz: direction (unit), w: cos(outer_angle)
+    vec4 color_intensity;      // rgb: color, a: intensity
+    vec4 cone;                 // x: cos(inner_angle), yzw: unused
+};
+
+layout(set = 0, binding = 0) uniform  SceneData{
+
+    mat4 view;
+    mat4 proj;
+    mat4 viewproj;
+    // Legacy single shadow matrix (used for near range in mixed mode)
+    mat4 lightViewProj;
+    vec4 ambientColor;
+    vec4 sunlightDirection; //w for sun power
+    vec4 sunlightColor;
+
+    // Cascaded shadow matrices (0 = near/simple map, 1..N-1 = CSM)
+    mat4 lightViewProjCascades[4];
+    // View-space split distances for selecting cascades (x,y,z,w)
+    vec4 cascadeSplitsView;
+    // Ray-query & reflection settings (packed)
+    // rtOptions.x = RT shadows enabled (1/0)
+    // rtOptions.y = cascade bitmask (bit i => cascade i assisted)
+    uvec4 rtOptions;
+    // rtParams.x = N·L threshold for hybrid shadows
+    // rtParams.y = shadows enabled flag (1.0 = on, 0.0 = off)
+    // rtParams.z = planet receiver clipmap shadow maps enabled flag (RT-only mode)
+    // rtParams.w = sun angular radius (radians) for analytic planet shadow penumbra
+    vec4  rtParams;
+
+    GPUPunctualLight punctualLights[MAX_PUNCTUAL_LIGHTS];
+    GPUSpotLight spotLights[MAX_SPOT_LIGHTS];
+    // Spot-light shadow matrices for first punctualShadowConfig.y spot lights.
+    mat4 spotLightShadowViewProj[MAX_SHADOWED_SPOT_LIGHTS];
+    // Point-light shadow matrices for first punctualShadowConfig.z point lights (6 faces each).
+    mat4 pointLightShadowViewProj[MAX_POINT_SHADOW_FACES];
+    // punctualShadowConfig.x = punctual shadow mode (0=off,1=map,2=rt,3=hybrid)
+    // punctualShadowConfig.y = active shadowed spot-light count
+    // punctualShadowConfig.z = active shadowed point-light count
+    uvec4 punctualShadowConfig;
+    // punctualShadowRtBudget.x = max RT-assisted spot lights in this frame
+    // punctualShadowRtBudget.y = max RT-assisted point lights in this frame
+    uvec4 punctualShadowRtBudget;
+    // punctualShadowParams.x = N·L threshold for hybrid RT assist
+    // punctualShadowParams.y = spot shadow depth bias
+    // punctualShadowParams.z = point shadow depth bias
+    vec4 punctualShadowParams;
+    // lightCounts.x = point light count
+    // lightCounts.y = spot light count
+    // lightCounts.z = planet occluder count (analytic directional sun shadow)
+    uvec4 lightCounts;
+
+    // Analytic planet shadow occluders (max 4):
+    // planetOccluders[i].xyz = center in render-local space, w = radius in meters.
+    vec4 planetOccluders[MAX_PLANET_OCCLUDERS];
+
+    // Shadow tuning:
+    // shadowTuning.x = minimum sun shadow visibility (0..1)
+    vec4 shadowTuning;
+
+    // Time parameters for animated effects:
+    // timeParams.x = elapsed time (seconds), timeParams.y = delta time (seconds)
+    vec4 timeParams;
+} sceneData;
+
+layout(set = 1, binding = 0) uniform GLTFMaterialData{
+
+    vec4 colorFactors;
+    vec4 metal_rough_factors;
+    vec4 extra[14];
+
+} materialData;
+// Convention (selected fields used by engine shaders):
+// - extra[0].x: normalScale (0 disables normal mapping)
+// - extra[0].y: occlusionStrength (0..1), extra[0].z: hasAO (1/0)
+// - extra[1].rgb: emissiveFactor
+// - extra[2].x: alphaCutoff (>0 enables alpha test for MASK materials)
+// - extra[2].y: gbuffer flags (planet-style: >0 => force clipmap receiver shadows in RT-only)
+// - Planet materials:
+//   extra[2].z = cube-face specular enabled (1/0), extra[2].w = specular strength
+//   extra[3].x = terrain material flag (1/0), extra[3].w = target ocean roughness
+//   extra[4] = (planetCenterLocal.xyz, planetRadiusM)
+//   extra[5] = (faceIndex, detailNormalStrength, cavityStrength, enableTerminatorShadow)
+//   extra[6].x = terrain height scale (meters), extra[6].y = terrain height offset (meters)
+// - Mesh VFX materials:
+//   extra[3].x = opacity multiplier, extra[3].y = fresnel power, extra[3].z = fresnel strength
+//   extra[4].rgb = tint
+// - extra[5]: (scrollVelocity1.xy, scrollVelocity2.xy) - noise UV scroll speeds
+// - extra[6]: (distortionStrength, noiseBlend, gradientAxis, emissionStrength)
+// - extra[7]: (coreColor.rgb, gradientStart)
+// - extra[8]: (edgeColor.rgb, gradientEnd)
+// - extra[9]: blackbody (x=enable, y=intensity, z=tempMinK, w=tempMaxK)
+// - extra[10]: blackbody noise (x=noiseScale, y=noiseContrast, z=scrollU, w=scrollV)
+// - extra[11]: blackbody shape (xyz=heatAxisLocal, w=hotEndBias[-1..1])
+// - extra[12]: blackbody animation (x=noiseSpeed multiplier, 0=static)
+// - extra[13]: blackbody hot range (x=hotRangeStart, y=hotRangeEnd)
+
+layout(set = 1, binding = 1) uniform sampler2D colorTex;
+layout(set = 1, binding = 2) uniform sampler2D metalRoughTex; // terrain path: height map
+layout(set = 1, binding = 3) uniform sampler2D normalMap;   // terrain path: object-space detail normal
+layout(set = 1, binding = 4) uniform sampler2D occlusionTex; // terrain path: cavity / AO (R channel)
+layout(set = 1, binding = 5) uniform sampler2D emissiveTex;  // emissive (RGB, sRGB)
+layout(set = 1, binding = 6) uniform sampler2D planetSpecularTex; // per-face planet specular mask (R, linear)

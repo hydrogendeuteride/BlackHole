@@ -1,0 +1,201 @@
+#pragma once
+
+#include "collision_shape.h"
+#include "mass_properties.h"
+#include <glm/vec3.hpp>
+#include <glm/gtc/quaternion.hpp>
+#include <cstdint>
+
+namespace Physics
+{
+    // ============================================================================
+    // Motion type
+    // ============================================================================
+
+    enum class MotionType
+    {
+        Static, // Never moves (walls, floors, terrain)
+        Kinematic, // Moved by code, not by physics (platforms, doors)
+        Dynamic // Fully simulated by physics (boxes, balls, characters)
+    };
+
+    // ============================================================================
+    // Collision layers
+    // ============================================================================
+
+    namespace Layer
+    {
+        constexpr uint32_t Default = 0;
+        constexpr uint32_t Static = 1;
+        constexpr uint32_t Dynamic = 2;
+        constexpr uint32_t Kinematic = 3;
+        constexpr uint32_t Player = 4;
+        constexpr uint32_t Enemy = 5;
+        constexpr uint32_t Projectile = 6;
+        constexpr uint32_t Trigger = 7;
+        constexpr uint32_t Debris = 8;
+        constexpr uint32_t Missile = 9;
+        constexpr uint32_t Count = 16;
+    }
+
+    // ============================================================================
+    // Body creation settings
+    // ============================================================================
+
+    struct BodySettings
+    {
+        // Shape
+        CollisionShape shape;
+
+        // User data (game entity id, pointer, etc.)
+        uint64_t user_data{0};
+
+        // Transform
+        glm::dvec3 position{0.0, 0.0, 0.0};
+        glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
+
+        // Motion
+        MotionType motion_type = MotionType::Dynamic;
+
+        // Physical properties
+        float mass = 1.0f; // Only used for dynamic bodies
+        bool has_explicit_mass = false; // true when the caller intentionally overrides total body mass
+        MassProperties mass_properties{};
+        bool has_explicit_mass_properties = false;
+        float friction = 0.5f;
+        float restitution = 0.0f; // Bounciness (0 = no bounce, 1 = perfect bounce)
+        float linear_damping = 0.0f;
+        float angular_damping = 0.05f;
+
+        // Collision filtering
+        uint32_t layer = Layer::Default;
+
+        // Flags
+        bool is_sensor = false; // Trigger volume, no physical response
+        bool start_active = true; // Start awake (dynamic bodies only)
+        bool allow_sleeping = true; // Can go to sleep when at rest
+
+        // Gravity
+        float gravity_scale = 1.0f; // 0 = no gravity, 1 = normal, 2 = double gravity
+
+        // ========================================================================
+        // Builder-style setters (return *this for chaining)
+        // ========================================================================
+
+        BodySettings &set_shape(const CollisionShape &s)
+        {
+            shape = s;
+            return *this;
+        }
+
+        BodySettings &set_user_data(uint64_t v)
+        {
+            user_data = v;
+            return *this;
+        }
+
+        BodySettings &set_position(const glm::dvec3 &p)
+        {
+            position = p;
+            return *this;
+        }
+
+        BodySettings &set_position(const glm::vec3 &p)
+        {
+            position = glm::dvec3(p);
+            return *this;
+        }
+
+        BodySettings &set_position(double x, double y, double z)
+        {
+            position = {x, y, z};
+            return *this;
+        }
+
+        BodySettings &set_rotation(const glm::quat &r)
+        {
+            rotation = r;
+            return *this;
+        }
+
+        BodySettings &set_static()
+        {
+            motion_type = MotionType::Static;
+            return *this;
+        }
+
+        BodySettings &set_kinematic()
+        {
+            motion_type = MotionType::Kinematic;
+            return *this;
+        }
+
+        BodySettings &set_dynamic()
+        {
+            motion_type = MotionType::Dynamic;
+            return *this;
+        }
+
+        BodySettings &set_mass(float m)
+        {
+            mass = m;
+            has_explicit_mass = true;
+            has_explicit_mass_properties = false;
+            return *this;
+        }
+
+        BodySettings &set_mass_properties(const MassProperties &value)
+        {
+            mass_properties = value;
+            has_explicit_mass_properties = value.valid();
+            if (has_explicit_mass_properties)
+            {
+                mass = static_cast<float>(value.mass_kg);
+                has_explicit_mass = true;
+            }
+            return *this;
+        }
+
+        BodySettings &set_friction(float f)
+        {
+            friction = f;
+            return *this;
+        }
+
+        BodySettings &set_restitution(float r)
+        {
+            restitution = r;
+            return *this;
+        }
+
+        BodySettings &set_linear_damping(float d)
+        {
+            linear_damping = d;
+            return *this;
+        }
+
+        BodySettings &set_angular_damping(float d)
+        {
+            angular_damping = d;
+            return *this;
+        }
+
+        BodySettings &set_layer(uint32_t l)
+        {
+            layer = l;
+            return *this;
+        }
+
+        BodySettings &set_sensor(bool s = true)
+        {
+            is_sensor = s;
+            return *this;
+        }
+
+        BodySettings &set_gravity_scale(float s)
+        {
+            gravity_scale = s;
+            return *this;
+        }
+    };
+} // namespace Physics
