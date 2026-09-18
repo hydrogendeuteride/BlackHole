@@ -54,6 +54,7 @@ namespace GameRuntime
         }
 
         _quit_requested = false;
+        constexpr uint32_t RESIZE_DEBOUNCE_MS = 150;
 
         game->on_init(*this);
 
@@ -79,6 +80,7 @@ namespace GameRuntime
                 if (input->resize_requested())
                 {
                     _renderer->resize_requested = true;
+                    _renderer->_last_resize_event_ms = input->last_resize_event_ms();
                     input->clear_resize_request();
                 }
             }
@@ -151,7 +153,9 @@ namespace GameRuntime
             // --- Handle resize --- //
             if (_renderer->resize_requested)
             {
-                if (_renderer->_swapchainManager)
+                const uint32_t now_ms = SDL_GetTicks();
+                if (_renderer->_swapchainManager &&
+                    now_ms - _renderer->_last_resize_event_ms >= RESIZE_DEBOUNCE_MS)
                 {
                     _renderer->_swapchainManager->resize_swapchain(_renderer->_window);
                     if (_renderer->ui())
@@ -228,6 +232,11 @@ namespace GameRuntime
                     }
                     _renderer->_pendingIBLRequest.active = false;
                 }
+            }
+
+            if (_renderer->picking())
+            {
+                _renderer->picking()->begin_frame();
             }
 
             // --- Flush per-frame resources --- ///

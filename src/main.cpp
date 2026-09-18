@@ -1,4 +1,4 @@
-#include "core/engine.h"
+#include "app/blackhole_app.h"
 #include "core/assets/locator.h"
 #include "core/util/logger.h"
 
@@ -501,10 +501,8 @@ namespace
     int run_application(const StartupOptions &options)
     {
         (void)options;
-        VulkanEngine engine;
-        engine.init();
-        engine.run();
-        engine.cleanup();
+        BlackholeApp app;
+        app.run();
         return 0;
     }
 } // namespace

@@ -62,6 +62,11 @@ run(IGameCallbacks*)                ← main loop entry point
 
 ## Usage
 
+The Blackhole sample starts in `src/app/blackhole_app.cpp`. `BlackholeApp::run()`
+initializes the renderer and runs this runtime with the app's lifecycle callbacks.
+Add sample scene setup to `on_init()` and per-frame behavior to `on_update()`.
+`Runtime::run()` owns the single main loop; `VulkanEngine` handles rendering.
+
 ### Basic game loop
 
 ```cpp

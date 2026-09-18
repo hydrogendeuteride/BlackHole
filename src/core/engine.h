@@ -214,9 +214,6 @@ public:
     // draw() will call this itself if the frame was not prepared explicitly.
     void prepare_scene_for_frame();
 
-	//run main loop
-	void run();
-
     // Window controls (runtime)
     void setWindowMode(WindowMode mode, int display_index);
 
@@ -271,6 +268,7 @@ public:
     void preloadInstanceTextures(const std::string &instanceName);
 
 	bool resize_requested{false};
+    uint32_t _last_resize_event_ms{0};
 	bool freeze_rendering{false};
     // Runtime-provided frame delta used by systems that need deterministic per-frame TTL/update timing.
     float _frame_delta_time_s{0.0f};
@@ -293,7 +291,4 @@ private:
 
     void initDefaultData();
 
-    // Debounce swapchain recreation during live window resizing.
-    uint32_t _last_resize_event_ms{0};
-    static constexpr uint32_t RESIZE_DEBOUNCE_MS = 150;
 };
