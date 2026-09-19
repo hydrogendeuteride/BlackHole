@@ -11,4 +11,11 @@ public:
     void on_update(float dt) override;
     void on_fixed_update(float fixed_dt) override;
     void on_shutdown() override;
+
+private:
+    void draw_ui();
+    GameRuntime::Runtime *_runtime = nullptr;
+    bool _show_ui = true;
+    bool _show_rays = false;
+    float _ray_progress = 1.0f;
 };

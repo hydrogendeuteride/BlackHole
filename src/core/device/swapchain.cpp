@@ -121,6 +121,7 @@ void SwapchainManager::resize_render_targets(VkExtent2D renderExtent)
     _depthImage.imageExtent = drawImageExtent;
     VkImageUsageFlags depthImageUsages{};
     depthImageUsages |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+    depthImageUsages |= VK_IMAGE_USAGE_SAMPLED_BIT;
     VkImageCreateInfo dimg_info = vkinit::image_create_info(_depthImage.imageFormat, depthImageUsages, drawImageExtent);
     vmaCreateImage(_deviceManager->allocator(), &dimg_info, &rimg_allocinfo, &_depthImage.image,
                    &_depthImage.allocation, nullptr);

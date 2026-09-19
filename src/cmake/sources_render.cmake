@@ -11,6 +11,8 @@ list(APPEND VULKAN_ENGINE_SOURCES
   # render/passes
   render/passes/background.h
   render/passes/background.cpp
+  render/passes/blackhole.h
+  render/passes/blackhole.cpp
   render/passes/sun_disk.h
   render/passes/sun_disk.cpp
   render/passes/geometry.h

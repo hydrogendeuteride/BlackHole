@@ -1,6 +1,7 @@
 #include "renderpass.h"
 
 #include "passes/background.h"
+#include "passes/blackhole.h"
 #include "passes/sun_disk.h"
 #include "passes/geometry.h"
 #include "passes/decal.h"
@@ -30,6 +31,10 @@ void RenderPassManager::init(EngineContext *context)
     auto backgroundPass = std::make_unique<BackgroundPass>();
     backgroundPass->init(context);
     addPass(std::move(backgroundPass));
+
+    auto blackholePass = std::make_unique<BlackholePass>();
+    blackholePass->init(context);
+    addPass(std::move(blackholePass));
 
     // Analytic sun disk over background (works in space, independent of atmosphere pass).
     auto sunDiskPass = std::make_unique<SunDiskPass>();

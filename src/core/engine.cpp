@@ -45,6 +45,7 @@
 #include "core/debug_draw/engine_debug_draw.h"
 #include "core/orbit_plot/orbit_plot.h"
 #include "render/passes/geometry.h"
+#include "render/passes/blackhole.h"
 #include "render/passes/decal.h"
 #include "render/passes/imgui_pass.h"
 #include "render/passes/lighting.h"
@@ -1646,6 +1647,11 @@ void VulkanEngine::draw()
             if (auto *transparent = _renderPassManager->getPass<TransparentPass>())
             {
                 transparent->register_graph(_renderGraph.get(), hdrTarget, hDepth);
+            }
+
+            if (auto *blackhole = _renderPassManager->getPass<BlackholePass>())
+            {
+                hdrTarget = blackhole->register_graph(_renderGraph.get(), hdrTarget, hDepth);
             }
 
             if (auto *autoExposure = _renderPassManager->getPass<AutoExposurePass>())
