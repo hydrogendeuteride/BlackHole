@@ -26,6 +26,18 @@ public:
     float star_size = 0.012f;
     float star_magnitude = 7.5f;
     float star_rotation = 0.0f;
+    bool disk = false;
+    bool disk_clouds = true;
+    float disk_speed = 1.0f;
+    float disk_time = 0.0f;
+    float disk_height = 0.08f;
+    float disk_contrast = 0.8f;
+    float disk_inner = 3.0f;
+    float disk_outer = 10.0f;
+    float disk_brightness = 3.0f;
+    float disk_temperature = 6500.0f;
+    float disk_absorption = 8.0f;
+    float disk_emission = 1.0f;
     uint32_t star_count() const { return _catalog.count; }
 
 private:

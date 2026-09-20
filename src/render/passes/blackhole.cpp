@@ -22,6 +22,9 @@ namespace
         glm::vec4 params;
         glm::vec4 star_params;
         glm::vec4 star_view;
+        glm::vec4 disk_params;
+        glm::vec4 disk_style;
+        glm::vec4 disk_optics;
     };
 }
 
@@ -68,7 +71,7 @@ void BlackholePass::cleanup()
 
 RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle color, RGImageHandle depth)
 {
-    if ((!enabled || radius <= 0.0f) && !stars) return color;
+    if ((!enabled || radius <= 0.0f) && !stars && !disk) return color;
     auto *ibl = _context->ibl;
     VkImageView env = ibl && ibl->backgroundIs2D() ? ibl->background().imageView : VK_NULL_HANDLE;
     if (!env && ibl && ibl->specularIs2D()) env = ibl->specular().imageView;
@@ -105,6 +108,11 @@ RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle co
             data.center_radius = glm::vec4(glm::vec3(center - ctx->origin_world), radius);
             data.params = glm::vec4(step, thickness, meshes ? 1.0f : 0.0f, enabled && radius > 0.0f ? 1.0f : 0.0f);
             data.star_params = glm::vec4(stars ? 1.0f : 0.0f, star_brightness, star_size, star_magnitude);
+            data.disk_params = glm::vec4(disk && radius > 0.0f ? 1.0f : 0.0f,
+                                         disk_inner, disk_outer, disk_brightness);
+            data.disk_style = glm::vec4(disk_contrast,
+                                        disk_clouds ? 1.0f : 0.0f, disk_time, disk_height);
+            data.disk_optics = glm::vec4(disk_temperature, disk_absorption, disk_emission, 0.0f);
             const auto draw_extent = ctx->getDrawExtent();
             const float pixel_angle = std::max(2.0f / (std::abs(scene.proj[0][0]) * draw_extent.width),
                                                2.0f / (std::abs(scene.proj[1][1]) * draw_extent.height));

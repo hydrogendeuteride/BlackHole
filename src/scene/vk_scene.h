@@ -215,6 +215,7 @@ public:
     struct GLTFInstance
     {
         std::shared_ptr<LoadedGLTF> scene;
+        bool visible = true;
         WorldVec3 translation_world{0.0, 0.0, 0.0};
         glm::quat rotation{1.0f, 0.0f, 0.0f, 0.0f};
         glm::quat visual_rotation{1.0f, 0.0f, 0.0f, 0.0f};
@@ -229,6 +230,7 @@ public:
     void addGLTFInstance(const std::string &name, std::shared_ptr<LoadedGLTF> scene,
                          const glm::mat4 &transform = glm::mat4(1.f));
     bool removeGLTFInstance(const std::string &name);
+    bool setGLTFInstanceVisible(const std::string &name, bool visible);
     bool getGLTFInstanceTransform(const std::string &name, glm::mat4 &outTransform);
     bool setGLTFInstanceTransform(const std::string &name, const glm::mat4 &transform,
                                   bool syncPhysicsBody = true);

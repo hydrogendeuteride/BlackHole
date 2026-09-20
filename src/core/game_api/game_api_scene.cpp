@@ -160,6 +160,13 @@ bool Engine::set_gltf_instance_visual_rotation(const std::string& name, const gl
            : false;
 }
 
+bool Engine::set_gltf_instance_visible(const std::string& name, bool visible)
+{
+    return _engine && _engine->_sceneManager
+           ? _engine->_sceneManager->setGLTFInstanceVisible(name, visible)
+           : false;
+}
+
 bool Engine::add_primitive_instance(const std::string& name,
                                     PrimitiveType type,
                                     const Transform& transform)

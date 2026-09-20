@@ -963,6 +963,7 @@ public:
 
     // Remove glTF instance
     bool remove_gltf_instance(const std::string& name);
+    bool set_gltf_instance_visible(const std::string& name, bool visible);
 
     // Remove any dynamic render instance registered under this name.
     bool remove_render_instance(const std::string& name);

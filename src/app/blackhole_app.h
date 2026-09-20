@@ -16,6 +16,5 @@ private:
     void draw_ui();
     GameRuntime::Runtime *_runtime = nullptr;
     bool _show_ui = true;
-    bool _show_rays = false;
-    float _ray_progress = 1.0f;
+    bool _show_car = true;
 };

@@ -195,6 +195,8 @@ void SceneManager::emitDynamicGLTFInstances(const WorldVec3 &origin_world, float
             inst.scene->updateAnimation(dt, inst.animation);
         }
 
+        if (!inst.visible) continue;
+
         const size_t opaque_start = mainDrawContext.OpaqueSurfaces.size();
         const size_t transparent_start = mainDrawContext.TransparentSurfaces.size();
         const size_t mesh_vfx_start = mainDrawContext.MeshVfxSurfaces.size();

@@ -345,6 +345,14 @@ std::shared_ptr<LoadedGLTF> SceneManager::getGLTFInstanceScene(const std::string
     return it != dynamicGLTFInstances.end() ? it->second.scene : nullptr;
 }
 
+bool SceneManager::setGLTFInstanceVisible(const std::string &name, bool visible)
+{
+    auto it = dynamicGLTFInstances.find(name);
+    if (it == dynamicGLTFInstances.end()) return false;
+    it->second.visible = visible;
+    return true;
+}
+
 bool SceneManager::getGLTFInstanceNodeWorldTransform(const std::string &instanceName,
                                                      const std::string &nodeName,
                                                      glm::mat4 &outWorldTransform) const
