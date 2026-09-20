@@ -84,9 +84,27 @@ void BlackholeApp::on_shutdown()
     _runtime = nullptr;
 }
 
+void BlackholeApp::set_free_camera(bool enabled)
+{
+    auto &api = _runtime->api();
+    if (!enabled)
+    {
+        auto orbit = api.get_orbit_camera_settings();
+        orbit.target.type = GameAPI::CameraTargetType::WorldPoint;
+        orbit.target.worldPoint = _runtime->renderer()->_renderPassManager->getPass<BlackholePass>()->center;
+        api.set_orbit_camera_settings(orbit);
+    }
+    // The rig preserves the pose on entering Free and derives the orbit from
+    // the current position on returning. Its mode switch releases mouse capture.
+    api.set_camera_mode(enabled ? GameAPI::CameraMode::Free : GameAPI::CameraMode::Orbit);
+}
+
 void BlackholeApp::draw_ui()
 {
     if (!_runtime) return;
+    auto &api = _runtime->api();
+    if (!ImGui::GetIO().WantTextInput && !ImGui::IsAnyItemActive() && ImGui::IsKeyPressed(ImGuiKey_C, false))
+        set_free_camera(api.get_camera_mode() != GameAPI::CameraMode::Free);
     if (ImGui::IsKeyPressed(ImGuiKey_F2)) _show_ui = !_show_ui;
     if (!_show_ui) return;
     auto *bh = _runtime->renderer()->_renderPassManager->getPass<BlackholePass>();
@@ -135,6 +153,36 @@ void BlackholeApp::draw_ui()
             ImGui::TableSetColumnIndex(1);
             ImGui::SetNextItemWidth(-1);
         };
+        if (settings("camera"))
+        {
+            row("Camera (C)");
+            int mode = api.get_camera_mode() == GameAPI::CameraMode::Free ? 1 : 0;
+            if (ImGui::Combo("##camera_mode", &mode, "Orbit\0Free\0")) set_free_camera(mode == 1);
+            if (mode == 1)
+            {
+                auto free = api.get_free_camera_settings();
+                row("Move speed");
+                if (ImGui::DragFloat("##move_speed", &free.moveSpeed, 0.02f, 0.06f, 100.0f, "%.2f", ImGuiSliderFlags_AlwaysClamp))
+                    api.set_free_camera_settings(free);
+            }
+            ImGui::EndTable();
+        }
+        if (api.get_camera_mode() == GameAPI::CameraMode::Free)
+        {
+            ImGui::TextDisabled("WASD: move | Space/Ctrl: up/down");
+            ImGui::TextDisabled("RMB: look | Q/E: roll | Wheel: speed");
+        }
+        if (ImGui::Button("Reset orbit"))
+        {
+            set_free_camera(false);
+            auto orbit = api.get_orbit_camera_settings();
+            orbit.distance = 10.0;
+            orbit.yaw = 0.0f;
+            orbit.pitch = glm::radians(12.0f);
+            api.set_orbit_camera_settings(orbit);
+            api.set_camera_fov(50.0f);
+        }
+
         section("1  Gravitational lensing", bh->enabled);
         if (settings("blackhole"))
         {
@@ -173,6 +221,8 @@ void BlackholeApp::draw_ui()
             ImGui::SliderFloat("##magnitude", &bh->star_magnitude, 2.0f, 7.5f, "%.1f");
             row("Sky rotation (deg)");
             ImGui::SliderFloat("##rotation", &bh->star_rotation, -180.0f, 180.0f, "%.1f");
+            row("Gravitational shift");
+            ImGui::Checkbox("##star_redshift", &bh->star_redshift);
             ImGui::EndTable();
         }
         ImGui::EndDisabled();
@@ -191,7 +241,7 @@ void BlackholeApp::draw_ui()
                 ImGui::SliderFloat("##disk_height", &bh->disk_height, 0.02f, 0.3f, "%.2f");
                 row("Cloud contrast");
                 ImGui::SliderFloat("##disk_contrast", &bh->disk_contrast, 0.0f, 1.0f, "%.2f");
-                row("Rotation speed");
+                row("Animation speed");
                 ImGui::SliderFloat("##disk_speed", &bh->disk_speed, -2.0f, 2.0f, "%.2f");
                 row("Inner temp (K)");
                 ImGui::SliderFloat("##disk_temperature", &bh->disk_temperature, 3000.0f, 20000.0f, "%.0f", ImGuiSliderFlags_Logarithmic);
@@ -202,6 +252,14 @@ void BlackholeApp::draw_ui()
             }
             ImGui::EndTable();
         }
+        ImGui::EndDisabled();
+
+        ImGui::BeginDisabled(!bh->disk || !bh->disk_clouds);
+        section("5  Gravitational redshift", bh->disk_redshift);
+        section("6  Doppler shift", bh->disk_doppler);
+        ImGui::BeginDisabled(!bh->disk_redshift && !bh->disk_doppler);
+        ImGui::Checkbox("Relativistic brightness", &bh->disk_beaming);
+        ImGui::EndDisabled();
         ImGui::EndDisabled();
 
         ImGui::Spacing();

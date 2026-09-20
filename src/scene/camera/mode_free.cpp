@@ -43,7 +43,9 @@ void FreeCameraMode::process_input(SceneManager & /*scene*/,
         if (st.key_down(Key::S)) { v.z += 1.0f; }
         if (st.key_down(Key::A)) { v.x -= 1.0f; }
         if (st.key_down(Key::D)) { v.x += 1.0f; }
-        _velocity = v;
+        if (st.key_down(Key::Space)) { v.y += 1.0f; }
+        if (st.key_down(Key::LeftCtrl) || st.key_down(Key::RightCtrl)) { v.y -= 1.0f; }
+        _velocity = glm::dot(v, v) > 1.0f ? glm::normalize(v) : v;
 
         float roll = 0.0f;
         if (st.key_down(Key::Q)) { roll -= 1.0f; }

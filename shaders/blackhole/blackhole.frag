@@ -12,11 +12,13 @@ layout(set = 0, binding = 0) uniform BlackholeData
     vec4 center_radius;
     vec4 params; // angular step, mesh thickness, mesh lensing
     vec4 star_params; // enabled, brightness, angular sigma (degrees), magnitude limit
-    vec4 star_view; // sky rotation (radians), pixel angle
+    vec4 star_view; // sky rotation (radians), pixel angle, frequency ratio
     vec4 disk_params; // enabled, inner radius (rs), outer radius (rs), brightness
     vec4 disk_style; // pattern contrast, clouds, animation time, height (rs)
     vec4 disk_optics; // inner temperature (K), absorption (1/rs), emission scale
+    vec4 disk_effects; // gravitational shift, Doppler, intensity shift, spin sign
 } blackhole;
+#include "blackhole/blackbody.glsl"
 #include "blackhole/stars.glsl"
 layout(set = 0, binding = 1) uniform sampler2D color_tex;
 layout(set = 0, binding = 2) uniform sampler2D depth_tex;

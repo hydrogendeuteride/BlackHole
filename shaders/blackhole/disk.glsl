@@ -9,8 +9,6 @@ vec4 disk_result(vec3 behind)
     return vec4(disk_light + disk_trans * behind, 1.0);
 }
 
-#include "blackhole/blackbody.glsl"
-
 vec4 disk_field(vec3 p, float age)
 {
     float r = length(p.xz);
@@ -76,7 +74,38 @@ float disk_hotspots(vec3 p)
     return hot;
 }
 
-void sample_disk(vec3 p, float ds)
+float disk_shift(vec3 p, vec3 back_dir)
+{
+    if (blackhole.disk_effects.x < 0.5 && blackhole.disk_effects.y < 0.5) return 1.0;
+    float radius = max(length(p), 1.001);
+    float lapse = 1.0 - 1.0 / radius;
+    float shift = 1.0;
+    if (blackhole.disk_effects.x > 0.5)
+    {
+        // Static observer at the camera's actual radius, not at infinity.
+        float observer = length(blackhole.camera.xyz - blackhole.center_radius.xyz) / blackhole.center_radius.w;
+        float observer_lapse = 1.0 - 1.0 / max(observer, 1.001);
+        shift *= sqrt(lapse / observer_lapse);
+    }
+    if (blackhole.disk_effects.y > 0.5)
+    {
+        vec3 radial = p / radius;
+        // Convert coordinate tangent to the local static orthonormal frame.
+        // Tracing runs camera -> disk; physical photons travel the other way.
+        float dr = dot(back_dir, radial);
+        vec3 photon = -normalize(back_dir + radial * dr * (inversesqrt(lapse) - 1.0));
+        float orbit_radius = max(length(p.xz), 3.0);
+        vec3 azimuth = vec3(-p.z, 0.0, p.x) / max(length(p.xz), 1e-6);
+        // Schwarzschild circular orbit: beta = r*Omega/sqrt(1-rs/r).
+        // Extend the equatorial velocity through our thin procedural volume.
+        float beta = sqrt(0.5 / (orbit_radius - 1.0));
+        vec3 velocity = azimuth * (beta * blackhole.disk_effects.w);
+        shift *= sqrt(1.0 - beta * beta) / (1.0 - dot(velocity, photon));
+    }
+    return shift;
+}
+
+void sample_disk(vec3 p, vec3 back_dir, float ds)
 {
     float inner = blackhole.disk_params.y;
     float outer = blackhole.disk_params.z;
@@ -114,7 +143,11 @@ void sample_disk(vec3 p, float ds)
     temperature *= mix(1.0, mix(0.94, 1.06, clumps), contrast);
     float hot = contrast > 0.0 ? disk_hotspots(p) : 0.0;
     temperature *= 1.0 + contrast * (0.035 * gas.z - 0.035 * gas.w + 0.09 * hot);
-    vec4 thermal = blackbody_sample(temperature);
+    float shift = disk_shift(p, back_dir);
+    vec4 thermal = blackbody_sample(temperature * shift);
+    // B_nu(g*T) already includes g^3 B_(nu/g)(T). Do not boost it twice.
+    // Disabling brightness is an explanatory color-only view, not full transfer.
+    if (blackhole.disk_effects.z < 0.5) thermal.w = blackbody_sample(temperature).w;
     float reference = blackbody_sample(blackhole.disk_optics.x).w;
     // Normalize once to the chosen inner temperature. Preserve relative visible
     // radiance across the disk; emission is a separate scene-exposure scale.
@@ -156,5 +189,5 @@ void integrate_disk(vec3 a, vec3 b)
     int steps = clamp(int(ceil((far - near) / min(0.06, blackhole.disk_style.w))), 1, 1024);
     float ds = (far - near) / float(steps);
     for (int i = 0; i < steps && disk_trans > 0.001; ++i)
-        sample_disk(a + dir * (near + (float(i) + 0.5) * ds), ds);
+        sample_disk(a + dir * (near + (float(i) + 0.5) * ds), dir, ds);
 }

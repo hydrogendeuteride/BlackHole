@@ -25,6 +25,7 @@ namespace
         glm::vec4 disk_params;
         glm::vec4 disk_style;
         glm::vec4 disk_optics;
+        glm::vec4 disk_effects;
     };
 }
 
@@ -71,6 +72,8 @@ void BlackholePass::cleanup()
 
 RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle color, RGImageHandle depth)
 {
+    // Animation speed is not a physical velocity; retain spin when paused.
+    if (disk_speed != 0.0f) _disk_direction = disk_speed < 0.0f ? -1.0f : 1.0f;
     if ((!enabled || radius <= 0.0f) && !stars && !disk) return color;
     auto *ibl = _context->ibl;
     VkImageView env = ibl && ibl->backgroundIs2D() ? ibl->background().imageView : VK_NULL_HANDLE;
@@ -113,10 +116,20 @@ RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle co
             data.disk_style = glm::vec4(disk_contrast,
                                         disk_clouds ? 1.0f : 0.0f, disk_time, disk_height);
             data.disk_optics = glm::vec4(disk_temperature, disk_absorption, disk_emission, 0.0f);
+            data.disk_effects = glm::vec4(disk_redshift ? 1.0f : 0.0f, disk_doppler ? 1.0f : 0.0f,
+                                          disk_beaming ? 1.0f : 0.0f, _disk_direction);
             const auto draw_extent = ctx->getDrawExtent();
             const float pixel_angle = std::max(2.0f / (std::abs(scene.proj[0][0]) * draw_extent.width),
                                                2.0f / (std::abs(scene.proj[1][1]) * draw_extent.height));
-            data.star_view = glm::vec4(glm::radians(star_rotation), std::min(pixel_angle, glm::radians(0.3f)), 0, 0);
+            float star_shift = 1.0f;
+            if (star_redshift && radius > 0.0f)
+            {
+                const double observer = glm::length(glm::dvec3(data.camera) + ctx->origin_world - center) / radius;
+                // Stars are stationary at infinity. A static observer near the
+                // hole receives blueshifted light; no camera-velocity Doppler.
+                star_shift = float(1.0 / std::sqrt(1.0 - 1.0 / std::max(observer, 1.001)));
+            }
+            data.star_view = glm::vec4(glm::radians(star_rotation), std::min(pixel_angle, glm::radians(0.3f)), star_shift, 0);
             auto buffer = resources->create_buffer(sizeof(data), VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT,
                                                    VMA_MEMORY_USAGE_CPU_TO_GPU);
             std::memcpy(buffer.info.pMappedData, &data, sizeof(data));

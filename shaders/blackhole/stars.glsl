@@ -5,14 +5,15 @@ layout(std430, set = 0, binding = 5) readonly buffer StarCells { uint cells[]; }
 
 vec3 star_color(float bv)
 {
-    // A restrained display palette from blue-white to warm orange. B-V is
-    // measured data; this RGB mapping is illustrative, not a spectral model.
-    vec3 blue = vec3(0.60, 0.75, 1.0);
-    vec3 white = vec3(1.0, 0.96, 0.88);
-    vec3 warm = vec3(1.0, 0.52, 0.23);
-    vec3 color = bv < 0.65 ? mix(blue, white, clamp((bv + 0.4) / 1.05, 0.0, 1.0))
-                           : mix(white, warm, clamp((bv - 0.65) / 1.35, 0.0, 1.0));
-    return color / dot(color, vec3(0.2126, 0.7152, 0.0722));
+    // Ballesteros (2012), https://arxiv.org/abs/1201.1809.
+    // B-V estimates a blackbody temperature, not a full stellar spectrum.
+    bv = clamp(bv, -0.4, 2.0);
+    float temperature = 4600.0 * (1.0 / (0.92 * bv + 1.7) + 1.0 / (0.92 * bv + 0.62));
+    vec4 emitted = blackbody_sample(temperature);
+    vec4 observed = blackbody_sample(temperature * blackhole.star_view.z);
+    // Keep catalogue magnitude as the unshifted flux reference. The LUT's
+    // luminance ratio adds spectral brightening without a second g^3 factor.
+    return observed.rgb * exp(observed.w - emitted.w);
 }
 
 vec3 star_background(vec3 dir)

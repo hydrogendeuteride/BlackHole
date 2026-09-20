@@ -6,8 +6,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA = ROOT / "tools/data/CIE_xyz_1931_2deg.csv"
-COUNT = 256
-MIN_TEMP, MAX_TEMP = 1000.0, 40000.0
+COUNT = 512
+MIN_TEMP, MAX_TEMP = 500.0, 1000000.0
 
 
 def spectrum_xyz(rows, temperature):
@@ -49,8 +49,8 @@ def main():
     lines += ["    vec4(" + ", ".join(f"{c:.9f}" for c in v) + ")" +
               ("," if i < COUNT - 1 else "") for i, v in enumerate(values)]
     lines += [");", "", "vec4 blackbody_sample(float temperature)", "{",
-              "    float index = log(clamp(temperature, 1000.0, 40000.0) / 1000.0) * (255.0 / log(40.0));",
-              "    int lo = min(int(index), 254);",
+              f"    float index = log(clamp(temperature, {MIN_TEMP:.1f}, {MAX_TEMP:.1f}) / {MIN_TEMP:.1f}) * ({COUNT - 1:.1f} / log({MAX_TEMP / MIN_TEMP:.1f}));",
+              f"    int lo = min(int(index), {COUNT - 2});",
               "    return mix(BLACKBODY_LUT[lo], BLACKBODY_LUT[lo + 1], index - float(lo));", "}", ""]
     target = ROOT / "shaders/blackhole/blackbody.glsl"
     target.write_text("\n".join(lines), encoding="utf-8")

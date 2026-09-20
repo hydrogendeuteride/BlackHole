@@ -14,6 +14,7 @@ public:
 
 private:
     void draw_ui();
+    void set_free_camera(bool enabled);
     GameRuntime::Runtime *_runtime = nullptr;
     bool _show_ui = true;
     bool _show_car = true;
