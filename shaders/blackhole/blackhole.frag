@@ -11,7 +11,10 @@ layout(set = 0, binding = 0) uniform BlackholeData
     vec4 camera;
     vec4 center_radius;
     vec4 params; // angular step, mesh thickness, mesh lensing
+    vec4 star_params; // enabled, brightness, angular sigma (degrees), magnitude limit
+    vec4 star_view; // sky rotation (radians), pixel angle
 } blackhole;
+#include "blackhole/stars.glsl"
 layout(set = 0, binding = 1) uniform sampler2D color_tex;
 layout(set = 0, binding = 2) uniform sampler2D depth_tex;
 layout(set = 0, binding = 3) uniform sampler2D sky_tex;
@@ -19,6 +22,7 @@ layout(set = 0, binding = 3) uniform sampler2D sky_tex;
 vec3 background(vec3 dir)
 {
     dir = normalize(dir);
+    if (blackhole.star_params.x > 0.5) return star_background(dir);
     vec2 uv = vec2(atan(dir.z, dir.x) * 0.15915494309 + 0.5,
                    acos(clamp(dir.y, -1.0, 1.0)) * 0.31830988618);
     return textureLod(sky_tex, uv, 0.0).rgb;
@@ -75,6 +79,14 @@ bool mesh_hit(vec3 a, vec3 b, out vec3 color)
 
 void main()
 {
+    vec2 ndc = inUV * 2.0 - 1.0;
+    vec3 dir = transpose(mat3(blackhole.view)) * normalize(vec3(ndc / vec2(blackhole.proj[0][0], blackhole.proj[1][1]), -1.0));
+    if (blackhole.params.w < 0.5)
+    {
+        outColor = textureLod(depth_tex, inUV, 0.0).r > 0.0 ? textureLod(color_tex, inUV, 0.0)
+                                                          : vec4(background(dir), 1.0);
+        return;
+    }
     if (blackhole.params.z < 0.5 && textureLod(depth_tex, inUV, 0.0).r > 0.0)
     {
         outColor = textureLod(color_tex, inUV, 0.0);
@@ -85,8 +97,6 @@ void main()
     vec3 pos = (blackhole.camera.xyz - center) / rs;
     float r = length(pos);
     if (r <= 1.001) { outColor = vec4(0, 0, 0, 1); return; }
-    vec2 ndc = inUV * 2.0 - 1.0;
-    vec3 dir = transpose(mat3(blackhole.view)) * normalize(vec3(ndc / vec2(blackhole.proj[0][0], blackhole.proj[1][1]), -1.0));
     vec3 n = pos / r;
     float radial = dot(dir, n);
     vec3 tangent = dir - radial * n;

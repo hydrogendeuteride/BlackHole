@@ -30,7 +30,8 @@ __pycache__/
 *.log
 /imgui.ini
 /nul
-/assets/
+/assets/*
+!/assets/stars/
 
 # Local planning and diagnostic captures
 /debug*.png

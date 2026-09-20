@@ -90,6 +90,7 @@ void BlackholeApp::on_init(GameRuntime::Runtime &runtime)
     auto &api = runtime.api();
     auto *blackhole = runtime.renderer()->_renderPassManager->getPass<BlackholePass>();
     blackhole->enabled = true;
+    blackhole->stars = true;
     runtime.renderer()->ui()->addDrawCallback([this]() { draw_ui(); });
 
     GameAPI::IBLPaths ibl;
@@ -152,6 +153,15 @@ void BlackholeApp::draw_ui()
     if (ImGui::Begin("Blackhole"))
     {
         ImGui::Checkbox("Lensing", &blackhole->enabled);
+        ImGui::Checkbox("Catalog stars", &blackhole->stars);
+        if (blackhole->stars)
+        {
+            ImGui::Text("HYG v4.1 / %u stars / J2000", blackhole->star_count());
+            ImGui::SliderFloat("Star brightness", &blackhole->star_brightness, 0.01f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
+            ImGui::SliderFloat("Star size (degrees)", &blackhole->star_size, 0.005f, 0.1f, "%.3f");
+            ImGui::SliderFloat("Magnitude limit", &blackhole->star_magnitude, 2.0f, 7.5f, "%.1f");
+            ImGui::SliderFloat("Sky rotation", &blackhole->star_rotation, -180.0f, 180.0f, "%.1f");
+        }
         ImGui::Checkbox("Mesh lensing (screen space)", &blackhole->meshes);
         ImGui::SliderFloat("Horizon radius", &blackhole->radius, 0.1f, 1.0f);
         glm::vec3 center(blackhole->center);
