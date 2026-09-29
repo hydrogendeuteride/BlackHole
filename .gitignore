@@ -37,13 +37,22 @@ __pycache__/
 /debug*.png
 /plan*.md
 /review*.md
-/blackhole_project.md
+/blackhole*.md
 /AGENTS.md
 
 # Recordings and rendered videos
 /recordings/
 /captures/
 /media/
+
+# Video production: only Manim scene sources are tracked
+/video/*
+!/video/blackbody.py
+!/video/curved.py
+!/video/disk_paths.py
+!/video/geodesic_surface.py
+!/video/light_paths.py
+!/video/pixels.py
 
 # Vendored examples/build output
 /third_party/ImGuizmo/bin/
