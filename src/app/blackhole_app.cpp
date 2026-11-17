@@ -436,12 +436,20 @@ void BlackholeApp::draw_ui()
         if (ImGui::Combo("Resolution", &resolution, "1280 x 720\0" "1920 x 1080\0" "2560 x 1440\0" "3840 x 2160\0"))
             _render_size = sizes[resolution];
 
-        auto section = [&](const char *label, bool &enabled)
+        auto section = [&](const char *label, bool &enabled, bool has_settings = true)
         {
             ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-            ImGui::Checkbox(label, &enabled);
+            if (!has_settings)
+            {
+                ImGui::Checkbox(label, &enabled);
+                return false;
+            }
+            ImGui::PushID(label);
+            ImGui::Checkbox("##enabled", &enabled);
+            ImGui::SameLine();
+            const bool open = ImGui::CollapsingHeader(label);
+            ImGui::PopID();
+            return open;
         };
         auto settings = [&](const char *id)
         {
@@ -484,8 +492,7 @@ void BlackholeApp::draw_ui()
         }
         if (ImGui::Button("Reset orbit")) reset_orbit(bh->center);
 
-        section("1  Gravitational lensing", bh->enabled);
-        if (settings("blackhole"))
+        if (section("1  Gravitational lensing", bh->enabled) && settings("blackhole"))
         {
             row("Horizon radius");
             ImGui::SliderFloat("##radius", &bh->radius, 0.1f, 1.0f, "%.2f");
@@ -493,15 +500,21 @@ void BlackholeApp::draw_ui()
             glm::vec3 center(bh->center);
             if (ImGui::DragFloat3("##center", &center.x, 0.05f, 0, 0, "%.2f")) bh->center = center;
             ImGui::BeginDisabled(!bh->enabled);
+            row("Ray integration");
+            int integration = bh->use_ray_lut && bh->ray_lut_available() ? 1 : 0;
+            ImGui::BeginDisabled(!bh->ray_lut_available());
+            if (ImGui::Combo("##ray_integration", &integration, "RK4\0LUT\0"))
+                bh->use_ray_lut = integration == 1;
+            ImGui::EndDisabled();
             row("Angular step");
             ImGui::SliderFloat("##step", &bh->step, 0.008f, 0.04f, "%.3f");
             ImGui::EndDisabled();
             ImGui::EndTable();
         }
         ImGui::BeginDisabled(!bh->enabled);
-        section("2  Mesh lensing", bh->meshes);
+        const bool mesh_open = section("2  Mesh lensing", bh->meshes);
         ImGui::BeginDisabled(!bh->meshes);
-        if (settings("mesh"))
+        if (mesh_open && settings("mesh"))
         {
             row("Mesh thickness");
             ImGui::SliderFloat("##thickness", &bh->thickness, 0.01f, 0.3f, "%.2f");
@@ -510,9 +523,9 @@ void BlackholeApp::draw_ui()
         ImGui::EndDisabled();
         ImGui::EndDisabled();
 
-        section("3  Stars", bh->stars);
+        const bool stars_open = section("3  Stars", bh->stars);
         ImGui::BeginDisabled(!bh->stars);
-        if (settings("stars"))
+        if (stars_open && settings("stars"))
         {
             row("Brightness");
             ImGui::SliderFloat("##star_brightness", &bh->star_brightness, 0.01f, 5.0f, "%.2f", ImGuiSliderFlags_Logarithmic);
@@ -528,9 +541,9 @@ void BlackholeApp::draw_ui()
         }
         ImGui::EndDisabled();
 
-        section("4  Disk", bh->disk);
+        const bool disk_open = section("4  Disk", bh->disk);
         ImGui::BeginDisabled(!bh->disk);
-        if (settings("disk_volume"))
+        if (disk_open && settings("disk_volume"))
         {
             row("Mode");
             int mode = bh->disk_clouds ? 1 : 0;
@@ -558,8 +571,8 @@ void BlackholeApp::draw_ui()
         ImGui::EndDisabled();
 
         ImGui::BeginDisabled(!bh->disk || !bh->disk_clouds);
-        section("5  Gravitational redshift", bh->disk_redshift);
-        section("6  Doppler shift", bh->disk_doppler);
+        section("5  Gravitational redshift", bh->disk_redshift, false);
+        section("6  Doppler shift", bh->disk_doppler, false);
         ImGui::BeginDisabled(!bh->disk_redshift && !bh->disk_doppler);
         ImGui::Checkbox("Relativistic brightness", &bh->disk_beaming);
         ImGui::EndDisabled();

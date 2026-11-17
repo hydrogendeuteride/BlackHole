@@ -178,6 +178,10 @@ static inline size_t bytes_per_texel(VkFormat fmt)
 {
     switch (fmt)
     {
+        case VK_FORMAT_R32G32_SFLOAT:
+            return 8;
+        case VK_FORMAT_R32G32B32A32_SFLOAT:
+            return 16;
         case VK_FORMAT_R8_UNORM:
         case VK_FORMAT_R8_SRGB:
             return 1;

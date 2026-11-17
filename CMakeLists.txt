@@ -165,3 +165,10 @@ if(VULKAN_ENGINE_BUILD_SHADERS)
         add_dependencies(blackhole shaders_spirv)
     endif()
 endif()
+
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND VULKAN_ENGINE_BUILD_SHADERS)
+    install(DIRECTORY "${VULKAN_ENGINE_SHADER_OUTPUT_DIR}/"
+        DESTINATION bin/shaders COMPONENT blackhole FILES_MATCHING PATTERN "*.spv")
+    install(DIRECTORY "${PROJECT_SOURCE_DIR}/assets/"
+        DESTINATION assets COMPONENT blackhole)
+endif()

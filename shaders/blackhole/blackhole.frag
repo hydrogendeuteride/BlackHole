@@ -2,6 +2,14 @@
 #extension GL_GOOGLE_include_directive : require
 #include "blackhole/ray.glsl"
 
+layout(constant_id = 0) const uint FEATURES = 0u;
+const bool LENSING = (FEATURES & 1u) != 0u;
+const bool MESH_LENSING = (FEATURES & 2u) != 0u;
+const bool RAY_LUT = (FEATURES & 4u) != 0u;
+const bool DISK_ENABLED = (FEATURES & 8u) != 0u;
+const bool VOLUME_DISK = (FEATURES & 16u) != 0u;
+const bool STARS_ENABLED = (FEATURES & 32u) != 0u;
+
 layout(location = 0) in vec2 inUV;
 layout(location = 0) out vec4 outColor;
 layout(set = 0, binding = 0) uniform BlackholeData
@@ -11,14 +19,16 @@ layout(set = 0, binding = 0) uniform BlackholeData
     vec4 camera;
     vec4 center_radius;
     vec4 params; // angular step, mesh thickness, mesh lensing
+    vec4 ray_params; // LUT enabled, maximum LUT step, maximum relative radial travel
     vec4 star_params; // enabled, brightness, angular sigma (degrees), magnitude limit
     vec4 star_view; // sky rotation (radians), pixel angle, frequency ratio
     vec4 disk_params; // enabled, inner radius (rs), outer radius (rs), brightness
     vec4 disk_style; // pattern contrast, clouds, animation time, height (rs)
     vec4 disk_optics; // inner temperature (K), absorption (1/rs), emission scale
     vec4 disk_effects; // gravitational shift, Doppler, intensity shift, spin sign
+    vec4 disk_motion; // drift, field ages, field blend weight
 } blackhole;
-#include "blackhole/blackbody.glsl"
+#include "blackhole/blackbody_texture.glsl"
 #include "blackhole/stars.glsl"
 layout(set = 0, binding = 1) uniform sampler2D color_tex;
 layout(set = 0, binding = 2) uniform sampler2D depth_tex;
@@ -27,54 +37,68 @@ layout(set = 0, binding = 3) uniform sampler2D sky_tex;
 vec3 background(vec3 dir)
 {
     dir = normalize(dir);
-    if (blackhole.star_params.x > 0.5) return star_background(dir);
+    if (STARS_ENABLED) return star_background(dir);
     vec2 uv = vec2(atan(dir.z, dir.x) * 0.15915494309 + 0.5,
                    acos(clamp(dir.y, -1.0, 1.0)) * 0.31830988618);
     return textureLod(sky_tex, uv, 0.0).rgb;
 }
 
-bool screen_depth(vec3 p, out vec2 uv, out float gap)
+// xy = clip xy, z = clip w, w = view z. Interpolate before perspective division.
+vec4 project_depth(vec3 p)
 {
     vec4 clip = blackhole.proj * vec4(p, 1.0);
-    if (clip.w <= 0.001) return false;
-    uv = clip.xy / clip.w * 0.5 + 0.5;
+    return vec4(clip.xy, clip.w, p.z);
+}
+
+bool projected_depth(vec4 p, out vec2 uv, out float gap)
+{
+    if (p.z <= 0.001) return false;
+    uv = p.xy / p.z * 0.5 + 0.5;
     if (any(lessThan(uv, vec2(0.0))) || any(greaterThanEqual(uv, vec2(1.0)))) return false;
     float depth = textureLod(depth_tex, uv, 0.0).r;
     if (depth <= 0.0) return false; // reversed-Z clear value
     float surface_z = -blackhole.proj[3][2] / (depth + blackhole.proj[2][2]);
-    gap = surface_z - p.z;
+    gap = surface_z - p.w;
     return true;
+}
+
+bool screen_depth(vec3 p, out vec2 uv, out float gap)
+{
+    return projected_depth(project_depth(p), uv, gap);
 }
 
 bool mesh_hit(vec3 a, vec3 b, out vec3 color, out float fraction)
 {
-    if (blackhole.params.z < 0.5) return false;
-    a = (blackhole.view * vec4(a, 1.0)).xyz;
-    b = (blackhole.view * vec4(b, 1.0)).xyz;
-    vec3 previous = a;
+    if (!MESH_LENSING) return false;
+    vec4 clip_a = project_depth(a);
+    vec4 clip_b = project_depth(b);
+    vec4 previous = clip_a;
     // Subdivide each curved-path segment before testing the depth surface.
     for (int j = 1; j <= 4; ++j)
     {
-        vec3 p = mix(a, b, float(j) * 0.25);
+        vec4 p = mix(clip_a, clip_b, float(j) * 0.25);
         vec2 uv;
         float gap;
-        if (screen_depth(p, uv, gap) && gap >= 0.0 &&
-            gap <= blackhole.params.y + abs(p.z - previous.z))
+        if (projected_depth(p, uv, gap) && gap >= 0.0 &&
+            gap <= blackhole.params.y + abs(p.w - previous.w))
         {
-            vec3 lo = previous;
-            vec3 hi = p;
+            vec4 lo = previous;
+            vec4 hi = p;
+            float lo_t = float(j - 1) * 0.25;
+            float hi_t = float(j) * 0.25;
             for (int k = 0; k < 5; ++k)
             {
-                vec3 mid = (lo + hi) * 0.5;
+                vec4 mid = (lo + hi) * 0.5;
                 vec2 mid_uv;
                 float mid_gap;
-                if (screen_depth(mid, mid_uv, mid_gap) && mid_gap >= 0.0) hi = mid;
-                else lo = mid;
+                float mid_t = (lo_t + hi_t) * 0.5;
+                if (projected_depth(mid, mid_uv, mid_gap) && mid_gap >= 0.0) { hi = mid; hi_t = mid_t; }
+                else { lo = mid; lo_t = mid_t; }
             }
-            if (screen_depth(hi, uv, gap) && gap >= 0.0 && gap <= blackhole.params.y)
+            if (projected_depth(hi, uv, gap) && gap >= 0.0 && gap <= blackhole.params.y)
             {
                 color = textureLod(color_tex, uv, 0.0).rgb;
-                fraction = clamp(length(hi - a) / max(length(b - a), 1e-7), 0.0, 1.0);
+                fraction = hi_t * min(length(b - a) / 1e-7, 1.0);
                 return true;
             }
         }
@@ -86,7 +110,7 @@ bool mesh_hit(vec3 a, vec3 b, out vec3 color, out float fraction)
 // Two-sided, opaque emitter in the black hole's equatorial plane.
 bool disk_hit(vec3 a, vec3 b, out vec3 hit)
 {
-    if (blackhole.disk_params.x < 0.5 || blackhole.disk_style.y > 0.5 || abs(b.y - a.y) < 1e-7) return false;
+    if (!DISK_ENABLED || VOLUME_DISK || abs(b.y - a.y) < 1e-7) return false;
     float t = (blackhole.center_radius.y - a.y) / (b.y - a.y);
     if (t <= 0.0 || t > 1.0) return false;
     hit = mix(a, b, t);
@@ -127,14 +151,20 @@ vec3 disk_color(vec3 hit)
     return pattern * blackhole.disk_params.w;
 }
 
-bool scene_hit(vec3 a, vec3 b, out vec3 color)
+bool scene_hit(vec3 a, vec3 b, inout vec3 mesh_pos, out vec3 color)
 {
     vec3 hit;
     bool disk = disk_hit(a, b, hit);
     // Only search for meshes in front of the opaque disk crossing.
     float fraction;
     vec3 end = disk ? hit : b;
-    bool mesh = mesh_hit(a, end, color, fraction);
+    bool mesh = false;
+    if (MESH_LENSING)
+    {
+        vec3 view_end = (blackhole.view * vec4(end, 1.0)).xyz;
+        mesh = mesh_hit(mesh_pos, view_end, color, fraction);
+        mesh_pos = view_end;
+    }
     integrate_disk(a, mesh ? mix(a, end, fraction) : end);
     if (mesh) return true;
     if (disk_trans < 0.001) { color = vec3(0); return true; }
@@ -144,11 +174,12 @@ bool scene_hit(vec3 a, vec3 b, out vec3 color)
 
 void main()
 {
+    if (DISK_ENABLED && VOLUME_DISK) disk_reference = blackbody_sample(blackhole.disk_optics.x).w;
     vec2 ndc = inUV * 2.0 - 1.0;
     vec3 dir = transpose(mat3(blackhole.view)) * normalize(vec3(ndc / vec2(blackhole.proj[0][0], blackhole.proj[1][1]), -1.0));
-    if (blackhole.params.w < 0.5)
+    if (!LENSING)
     {
-        if (blackhole.disk_params.x > 0.5 && blackhole.disk_style.y > 0.5)
+        if (DISK_ENABLED && VOLUME_DISK)
         {
             float depth = textureLod(depth_tex, inUV, 0.0).r;
             float distance = length(blackhole.camera.xyz - blackhole.center_radius.xyz) +
@@ -180,7 +211,7 @@ void main()
                                                           : vec4(background(dir), 1.0);
         return;
     }
-    if (blackhole.params.z < 0.5 && textureLod(depth_tex, inUV, 0.0).r > 0.0)
+    if (!MESH_LENSING && textureLod(depth_tex, inUV, 0.0).r > 0.0)
     {
         outColor = textureLod(color_tex, inUV, 0.0);
         return;
@@ -195,10 +226,12 @@ void main()
     vec3 tangent = dir - radial * n;
     float tlen = length(tangent);
     vec3 color;
+    vec3 mesh_pos = vec3(0.0);
+    if (MESH_LENSING) mesh_pos = (blackhole.view * vec4(blackhole.camera.xyz, 1.0)).xyz;
     if (tlen < 1e-5)
     {
         float distance = radial < 0.0 ? (r - 1.0) * rs : 200.0 * rs;
-        if (scene_hit(blackhole.camera.xyz, blackhole.camera.xyz + dir * distance, color)) outColor = disk_result(color);
+        if (scene_hit(blackhole.camera.xyz, blackhole.camera.xyz + dir * distance, mesh_pos, color)) outColor = disk_result(color);
         else outColor = disk_result(radial < 0.0 ? vec3(0) : background(dir));
         return;
     }
@@ -212,7 +245,10 @@ void main()
         // Limit both angular change and relative radial travel; avoid long mesh-skipping segments.
         float dt = min(blackhole.params.x, 0.08 * u / max(length(vec2(u, du)), 1e-6));
         float old_u = u;
-        step_ray(u, du, dt);
+        if (RAY_LUT)
+            step_ray_lut(u, du, dt, blackhole.ray_params.y, blackhole.ray_params.z);
+        else
+            step_ray(u, du, dt);
         phi += dt;
         if (u <= 0.0) { outColor = disk_result(background(dir)); return; }
         vec3 basis = cos(phi) * n + sin(phi) * tangent;
@@ -224,7 +260,7 @@ void main()
             float horizon_phi = phi - dt + dt * fraction;
             next = cos(horizon_phi) * n + sin(horizon_phi) * tangent;
         }
-        if (scene_hit(center + pos * rs, center + next * rs, color))
+        if (scene_hit(center + pos * rs, center + next * rs, mesh_pos, color))
         {
             outColor = disk_result(color);
             return;

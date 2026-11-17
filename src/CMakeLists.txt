@@ -20,6 +20,13 @@ endif()
 target_link_libraries(vulkan_engine PRIVATE vulkan_engine::cpu_options)
 target_link_libraries(blackhole PRIVATE vulkan_renderer::renderer)
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  set_target_properties(blackhole PROPERTIES
+    INSTALL_RPATH "$ORIGIN/lib"
+    INSTALL_RPATH_USE_LINK_PATH FALSE)
+  install(TARGETS blackhole RUNTIME DESTINATION bin COMPONENT blackhole)
+endif()
+
 set_target_properties(vulkan_engine blackhole PROPERTIES CXX_STANDARD 20)
 target_compile_definitions(vulkan_engine PUBLIC GLM_FORCE_DEPTH_ZERO_TO_ONE)
 

@@ -25,6 +25,8 @@ struct GraphicsPipelineCreateInfo
 
     std::vector<VkDescriptorSetLayout> setLayouts;
     std::vector<VkPushConstantRange> pushConstants;
+    // uint32 specialization constants with consecutive IDs starting at zero.
+    std::vector<uint32_t> fragmentConstants;
 
     // This function MUST set things like topology, rasterization, depth/blend state
     // and color/depth attachment formats on the builder.

@@ -3,29 +3,24 @@
 // Smooth surface density, vertical falloff, orbiting turbulence and absorption.
 vec3 disk_light = vec3(0.0);
 float disk_trans = 1.0;
+float disk_reference = 0.0;
 
 vec4 disk_result(vec3 behind)
 {
     return vec4(disk_light + disk_trans * behind, 1.0);
 }
 
-vec4 disk_field(vec3 p, float age)
+vec4 disk_field(vec3 p, vec3 orbit, float age)
 {
-    float r = length(p.xz);
-    float angle = atan(p.z, p.x);
-    float time = blackhole.disk_style.z;
-    float omega = 8.0 * sqrt(0.5 / (r * r * r));
-    float anchor = blackhole.disk_params.y * 1.6;
-    float drift = 8.0 * sqrt(0.5 / (anchor * anchor * anchor));
-    // Only the common rotation uses absolute time. Differential shear has a
-    // bounded age, so a long-running scene cannot wind into finer and finer rings.
-    float phi = angle - time * drift - age * (omega - drift);
-    float radial = 12.0 * log(r / blackhole.disk_params.y);
+    // Shared polar coordinates and shear are evaluated once for both fields.
+    float phi = orbit.x - age * orbit.y;
+    float radial = orbit.z;
     vec3 flow = vec3(2.5 * cos(phi), 2.5 * sin(phi), radial);
     float warp = disk_noise(flow * 0.7 + vec3(5.2, 1.3, 0.0)) - 0.5;
     // Narrow radial features and longer azimuthal features form orbiting wisps.
     phi += warp * 0.12;
-    vec3 q = vec3(1.8 * cos(phi), 1.8 * sin(phi), radial + warp * 0.2);
+    vec2 circle = vec2(cos(phi), sin(phi));
+    vec3 q = vec3(1.8 * circle, radial + warp * 0.2);
     q.z += p.y * 2.0;
     float broad = disk_noise(q);
     vec3 detail_pos = q * 2.7 + vec3(17.1, 9.2, 13.7);
@@ -33,29 +28,27 @@ vec4 disk_field(vec3 p, float age)
     float detail = disk_noise(detail_pos) * 0.67 + disk_noise(detail_pos * 2.03) * 0.33;
     // Warped noise contours form uneven arcs; a separate mask breaks them
     // into lengths instead of drawing complete concentric rings.
-    vec3 strand_pos = vec3(1.2 * cos(phi), 1.2 * sin(phi), radial * 1.65 + warp * 1.5);
+    vec3 strand_pos = vec3(1.2 * circle, radial * 1.65 + warp * 1.5);
     float strand = 1.0 - abs(2.0 * disk_noise(strand_pos) - 1.0);
     float gap = 1.0 - abs(2.0 * disk_noise(strand_pos + vec3(8.3, 2.8, 5.1)) - 1.0);
-    float mask = disk_noise(vec3(3.5 * cos(phi), 3.5 * sin(phi), radial * 0.4 + 7.2));
+    float mask = disk_noise(vec3(3.5 * circle, radial * 0.4 + 7.2));
     float bright = smoothstep(0.72, 0.96, strand) * smoothstep(0.35, 0.65, mask);
     float dark = smoothstep(0.8, 0.98, gap) * (1.0 - smoothstep(0.4, 0.7, mask));
     return vec4(broad, detail, bright, dark);
 }
 
-vec4 disk_turbulence(vec3 p)
+vec4 disk_turbulence(vec3 p, float r, float angle)
 {
-    // Staggered 8-second lifetimes. Each field resets with zero weight and
-    // zero blend slope, including when time runs backwards.
-    float age = mod(blackhole.disk_style.z, 8.0) - 4.0;
-    float other = mod(blackhole.disk_style.z + 4.0, 8.0) - 4.0;
-    float weight = 0.5 + 0.5 * cos(age * (6.28318530718 / 8.0));
-    return mix(disk_field(p, other), disk_field(p, age), weight);
+    float drift = blackhole.disk_motion.x;
+    vec3 orbit = vec3(angle - blackhole.disk_style.z * drift,
+                      8.0 * sqrt(0.5 / (r * r * r)) - drift,
+                      12.0 * log(r / blackhole.disk_params.y));
+    return mix(disk_field(p, orbit, blackhole.disk_motion.z),
+               disk_field(p, orbit, blackhole.disk_motion.y), blackhole.disk_motion.w);
 }
 
-float disk_hotspots(vec3 p)
+float disk_hotspots(float r, float angle)
 {
-    float r = length(p.xz);
-    float angle = atan(p.z, p.x);
     float time = blackhole.disk_style.z;
     float inner = blackhole.disk_params.y;
     float hot = 0.0;
@@ -74,7 +67,7 @@ float disk_hotspots(vec3 p)
     return hot;
 }
 
-float disk_shift(vec3 p, vec3 back_dir)
+float disk_shift(vec3 p, float r, vec3 back_dir)
 {
     if (blackhole.disk_effects.x < 0.5 && blackhole.disk_effects.y < 0.5) return 1.0;
     float radius = max(length(p), 1.001);
@@ -83,9 +76,7 @@ float disk_shift(vec3 p, vec3 back_dir)
     if (blackhole.disk_effects.x > 0.5)
     {
         // Static observer at the camera's actual radius, not at infinity.
-        float observer = length(blackhole.camera.xyz - blackhole.center_radius.xyz) / blackhole.center_radius.w;
-        float observer_lapse = 1.0 - 1.0 / max(observer, 1.001);
-        shift *= sqrt(lapse / observer_lapse);
+        shift *= sqrt(lapse) * blackhole.disk_optics.w;
     }
     if (blackhole.disk_effects.y > 0.5)
     {
@@ -94,8 +85,8 @@ float disk_shift(vec3 p, vec3 back_dir)
         // Tracing runs camera -> disk; physical photons travel the other way.
         float dr = dot(back_dir, radial);
         vec3 photon = -normalize(back_dir + radial * dr * (inversesqrt(lapse) - 1.0));
-        float orbit_radius = max(length(p.xz), 3.0);
-        vec3 azimuth = vec3(-p.z, 0.0, p.x) / max(length(p.xz), 1e-6);
+        float orbit_radius = max(r, 3.0);
+        vec3 azimuth = vec3(-p.z, 0.0, p.x) / max(r, 1e-6);
         // Schwarzschild circular orbit: beta = r*Omega/sqrt(1-rs/r).
         // Extend the equatorial velocity through our thin procedural volume.
         float beta = sqrt(0.5 / (orbit_radius - 1.0));
@@ -120,13 +111,15 @@ void sample_disk(vec3 p, vec3 back_dir, float ds)
     // Use relative height for noise as well, so thickness does not change the
     // column's pattern or integrated optical depth.
     vec3 noise_pos = vec3(p.x, vertical * 0.08, p.z);
-    vec4 gas = contrast > 0.0 ? disk_turbulence(noise_pos) : vec4(0.5, 0.5, 0.0, 0.0);
+    float angle = contrast > 0.0 ? atan(p.z, p.x) : 0.0;
+    vec4 gas = contrast > 0.0 ? disk_turbulence(noise_pos, r, angle) : vec4(0.5, 0.5, 0.0, 0.0);
     float clumps = gas.x;
     float detail = gas.y;
     // A phenomenological surface-density law, not a solved alpha-disk model.
     // Sigma has a reference column of 1 rs at the inner radius. Normalize the
     // vertical Gaussian so changing H preserves Sigma and thus optical depth.
-    float surface = pow(inner / r, 0.6);
+    float radial_ratio = inner / r;
+    float surface = pow(radial_ratio, 0.6);
     surface *= smoothstep(inner, inner * 1.05, r) * (1.0 - smoothstep(outer * 0.8, outer, r));
     float density = surface * (0.39894228 / height) * exp(-0.5 * vertical * vertical);
     density *= 1.0 - smoothstep(3.0, 4.0, abs(vertical));
@@ -139,19 +132,18 @@ void sample_disk(vec3 p, vec3 back_dir, float ds)
 
     // Original thin-disk approximation: T(r) = T_inner * (r_inner/r)^(3/4).
     // Small local temperature variations affect both chromaticity and radiance.
-    float temperature = blackhole.disk_optics.x * pow(inner / r, 0.75);
+    float temperature = blackhole.disk_optics.x * pow(radial_ratio, 0.75);
     temperature *= mix(1.0, mix(0.94, 1.06, clumps), contrast);
-    float hot = contrast > 0.0 ? disk_hotspots(p) : 0.0;
+    float hot = contrast > 0.0 ? disk_hotspots(r, angle) : 0.0;
     temperature *= 1.0 + contrast * (0.035 * gas.z - 0.035 * gas.w + 0.09 * hot);
-    float shift = disk_shift(p, back_dir);
+    float shift = disk_shift(p, r, back_dir);
     vec4 thermal = blackbody_sample(temperature * shift);
     // B_nu(g*T) already includes g^3 B_(nu/g)(T). Do not boost it twice.
     // Disabling brightness is an explanatory color-only view, not full transfer.
     if (blackhole.disk_effects.z < 0.5) thermal.w = blackbody_sample(temperature).w;
-    float reference = blackbody_sample(blackhole.disk_optics.x).w;
     // Normalize once to the chosen inner temperature. Preserve relative visible
     // radiance across the disk; emission is a separate scene-exposure scale.
-    vec3 source = thermal.rgb * exp(thermal.w - reference) * blackhole.disk_optics.z;
+    vec3 source = thermal.rgb * exp(thermal.w - disk_reference) * blackhole.disk_optics.z;
     float trans = exp(-blackhole.disk_optics.y * density * ds);
     disk_light += disk_trans * (1.0 - trans) * source;
     disk_trans *= trans;
@@ -159,7 +151,7 @@ void sample_disk(vec3 p, vec3 back_dir, float ds)
 
 void integrate_disk(vec3 a, vec3 b)
 {
-    if (blackhole.disk_params.x < 0.5 || blackhole.disk_style.y < 0.5) return;
+    if (!DISK_ENABLED || !VOLUME_DISK) return;
     a = (a - blackhole.center_radius.xyz) / blackhole.center_radius.w;
     b = (b - blackhole.center_radius.xyz) / blackhole.center_radius.w;
     vec3 delta = b - a;

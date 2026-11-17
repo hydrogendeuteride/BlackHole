@@ -24,7 +24,9 @@ def spectrum_xyz(rows, temperature):
 
 def main():
     raw = DATA.read_bytes()
-    if hashlib.sha256(raw).hexdigest() != "fa663e3535a7e0763a745993a1f0a192eb0275ac46ad2d1befd7626841e713c1":
+    # The published checksum uses CRLF; Git checkouts may normalize to LF.
+    canonical = raw.replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    if hashlib.sha256(canonical).hexdigest() != "fa663e3535a7e0763a745993a1f0a192eb0275ac46ad2d1befd7626841e713c1":
         raise ValueError("CIE source checksum mismatch")
     rows = [list(map(float, row)) for row in csv.reader(raw.decode().splitlines())]
     reference = spectrum_xyz(rows, 6500.0)[1]
@@ -54,6 +56,15 @@ def main():
               "    return mix(BLACKBODY_LUT[lo], BLACKBODY_LUT[lo + 1], index - float(lo));", "}", ""]
     target = ROOT / "shaders/blackhole/blackbody.glsl"
     target.write_text("\n".join(lines), encoding="utf-8")
+    # Keep the GLSL table for the video tools; the renderer uploads the same
+    # values from C++ instead of dynamically indexing a shader-local array.
+    header = ROOT / "src/render/passes/blackbody_lut.h"
+    cpp = lines[:4] + ["#pragma once", "", "namespace BlackbodyLut", "{",
+                      f"    inline constexpr unsigned COUNT = {COUNT};",
+                      "    inline constexpr float VALUES[COUNT][4] = {"]
+    cpp += ["        {" + ", ".join(f"{c:.9f}f" for c in v) + "}," for v in values]
+    cpp += ["    };", "}", ""]
+    header.write_text("\n".join(cpp), encoding="utf-8")
     print(f"Generated {COUNT} temperatures from {len(rows)} CIE samples: {target}")
 
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Configure + build (+ optionally test) the engine.
 
-Usage: build.py [debug|release] [linux|windows] [-q] [--test] [--no-shaders]
+Usage: build.py [debug|release] [linux|windows] [-q] [--test] [--no-shaders] [--package]
     python3 ./build.py -q                # release, Linux clang
     py .\\build.py debug windows --test   # debug + tests, Windows clang-cl
 """
@@ -74,6 +74,7 @@ def main() -> int:
     quiet = pop_flag("-q", "--quiet")
     run_tests = pop_flag("--test", "--tests")
     build_shaders = not pop_flag("--no-shaders")
+    package = pop_flag("--package")
 
     config = CONFIGS.get((args[0] if args else "release").lower())
     target = (args[1] if len(args) > 1 else ("windows" if os.name == "nt" else "linux")).lower()
@@ -83,6 +84,10 @@ def main() -> int:
         fail("platform must be linux or windows")
     if len(args) > 2:
         fail("too many arguments")
+    if package and (target != "linux" or not sys.platform.startswith("linux") or config != "Release"):
+        fail("--package requires a Linux Release build on Linux")
+    if package and not build_shaders:
+        fail("--package requires shader compilation")
     devshell = find_vsdev() if target == "windows" and os.name == "nt" else None
     if not shutil.which("cmake"):
         fail("missing command: cmake")
@@ -109,6 +114,9 @@ def main() -> int:
             if quiet:
                 print("Testing...", flush=True)
             run(["ctest", "--test-dir", str(build_dir), "--output-on-failure"], devshell, quiet)
+        if package:
+            from package_linux import create_package
+            create_package(build_dir)
     except subprocess.CalledProcessError as exc:
         return exc.returncode
     return 0

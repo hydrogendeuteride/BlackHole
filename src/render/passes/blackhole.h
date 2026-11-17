@@ -3,6 +3,7 @@
 #include "render/renderpass.h"
 #include "render/graph/types.h"
 #include "star_catalog.h"
+#include <array>
 
 class RenderGraph;
 
@@ -20,6 +21,7 @@ public:
     glm::dvec3 center{0.0, 0.7, 0.0};
     float radius = 0.45f;
     float step = 0.025f;
+    bool use_ray_lut = true;
     float thickness = 0.08f;
     bool stars = false;
     float star_brightness = 0.5f;
@@ -43,11 +45,17 @@ public:
     bool disk_doppler = true;
     bool disk_beaming = true;
     uint32_t star_count() const { return _catalog.count; }
+    bool ray_lut_available() const { return _ray_lut_available; }
 
 private:
+    bool create_pipeline(uint32_t features);
+    std::array<bool, 64> _variants{};
     float _disk_direction = 1.0f;
     EngineContext *_context = nullptr;
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     StarCatalog _catalog;
     AllocatedImage _fallback{};
+    AllocatedImage _ray_lut{};
+    AllocatedImage _blackbody_lut{};
+    bool _ray_lut_available = false;
 };

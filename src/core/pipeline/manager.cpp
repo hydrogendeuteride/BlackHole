@@ -241,6 +241,17 @@ bool PipelineManager::buildGraphics(GraphicsPipelineRecord &rec) const
     }
 
     if (rec.spec.configure) rec.spec.configure(builder);
+    std::vector<VkSpecializationMapEntry> entries;
+    for (uint32_t i = 0; i < rec.spec.fragmentConstants.size(); ++i)
+        entries.push_back({i, uint32_t(i * sizeof(uint32_t)), sizeof(uint32_t)});
+    VkSpecializationInfo specialization{};
+    specialization.mapEntryCount = uint32_t(entries.size());
+    specialization.pMapEntries = entries.data();
+    specialization.dataSize = rec.spec.fragmentConstants.size() * sizeof(uint32_t);
+    specialization.pData = rec.spec.fragmentConstants.data();
+    if (!entries.empty())
+        for (auto &stage : builder._shaderStages)
+            if (stage.stage == VK_SHADER_STAGE_FRAGMENT_BIT) stage.pSpecializationInfo = &specialization;
     builder._pipelineLayout = rec.layout;
 
     rec.pipeline = builder.build_pipeline(_context->getDevice()->device());

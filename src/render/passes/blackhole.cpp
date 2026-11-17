@@ -1,4 +1,6 @@
 #include "blackhole.h"
+#include "ray_lut.h"
+#include "blackbody_lut.h"
 
 #include "core/context.h"
 #include "core/assets/ibl_manager.h"
@@ -20,12 +22,14 @@ namespace
         glm::vec4 camera;
         glm::vec4 center_radius;
         glm::vec4 params;
+        glm::vec4 ray_params;
         glm::vec4 star_params;
         glm::vec4 star_view;
         glm::vec4 disk_params;
         glm::vec4 disk_style;
         glm::vec4 disk_optics;
         glm::vec4 disk_effects;
+        glm::vec4 disk_motion;
     };
 }
 
@@ -33,9 +37,31 @@ void BlackholePass::init(EngineContext *context)
 {
     _context = context;
     _catalog.init(context);
+    _blackbody_lut = context->getResources()->create_image(BlackbodyLut::VALUES,
+        {BlackbodyLut::COUNT, 1, 1}, VK_FORMAT_R32G32B32A32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT);
     const uint32_t black = 0;
     _fallback = context->getResources()->create_image(&black, {1, 1, 1}, VK_FORMAT_R8G8B8A8_UNORM,
                                                      VK_IMAGE_USAGE_SAMPLED_BIT);
+    VkFormatProperties properties{};
+    vkGetPhysicalDeviceFormatProperties(context->getDevice()->physicalDevice(), VK_FORMAT_R32G32_SFLOAT, &properties);
+    const VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                          VK_FORMAT_FEATURE_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_DST_BIT |
+                                          VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    _ray_lut_available = (properties.optimalTilingFeatures & required) == required;
+    if (_ray_lut_available)
+    {
+        const auto values = RayLut::generate();
+        _ray_lut = context->getResources()->create_image(values.data(),
+            {RayLut::WIDTH, RayLut::HEIGHT, RayLut::DEPTH}, VK_FORMAT_R32G32_SFLOAT, VK_IMAGE_USAGE_SAMPLED_BIT);
+    }
+    else
+    {
+        // Keep a valid 3D descriptor even when this GPU must use RK4.
+        const uint32_t empty[2]{};
+        _ray_lut = context->getResources()->create_image(empty, {1, 1, 2}, VK_FORMAT_R8G8B8A8_UNORM,
+                                                        VK_IMAGE_USAGE_SAMPLED_BIT);
+    }
     DescriptorLayoutBuilder builder;
     builder.add_binding(0, VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER);
     for (uint32_t i = 1; i <= 3; ++i)
@@ -44,11 +70,19 @@ void BlackholePass::init(EngineContext *context)
     }
     builder.add_binding(4, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
     builder.add_binding(5, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+    builder.add_binding(6, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+    builder.add_binding(7, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
     _layout = builder.build(context->getDevice()->device(), VK_SHADER_STAGE_FRAGMENT_BIT);
+}
+
+bool BlackholePass::create_pipeline(uint32_t features)
+{
+    auto *context = _context;
     GraphicsPipelineCreateInfo info{};
     info.vertexShaderPath = context->getAssets()->shaderPath("common/fullscreen.vert.spv");
     info.fragmentShaderPath = context->getAssets()->shaderPath("blackhole/blackhole.frag.spv");
     info.setLayouts = {_layout};
+    info.fragmentConstants = {features};
     info.configure = [context](PipelineBuilder &b)
     {
         b.set_input_topology(VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST);
@@ -59,14 +93,18 @@ void BlackholePass::init(EngineContext *context)
         b.disable_blending();
         b.set_color_attachment_format(context->getSwapchain()->drawImage().imageFormat);
     };
-    context->pipelines->createGraphicsPipeline("blackhole", info);
+    return context->pipelines->createGraphicsPipeline("blackhole." + std::to_string(features), info);
 }
 
 void BlackholePass::cleanup()
 {
     _catalog.cleanup(_context);
     _context->getResources()->destroy_image(_fallback);
-    _context->pipelines->unregisterGraphics("blackhole");
+    _context->getResources()->destroy_image(_ray_lut);
+    _context->getResources()->destroy_image(_blackbody_lut);
+    for (uint32_t i = 0; i < _variants.size(); ++i)
+        if (_variants[i]) _context->pipelines->unregisterGraphics("blackhole." + std::to_string(i));
+    _variants.fill(false);
     vkDestroyDescriptorSetLayout(_context->getDevice()->device(), _layout, nullptr);
 }
 
@@ -81,7 +119,14 @@ RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle co
     if (!env) env = _fallback.imageView;
     VkPipeline pipeline{};
     VkPipelineLayout pipeline_layout{};
-    if (!env || !_context->pipelines->getGraphics("blackhole", pipeline, pipeline_layout)) return color;
+    // Must match FEATURES in blackhole.frag. Cache only combinations actually used.
+    const bool lensing = enabled && radius > 0.0f;
+    const bool disk_enabled = disk && radius > 0.0f;
+    const uint32_t features = (lensing ? 1u : 0u) |
+        (lensing && meshes ? 2u : 0u) | (lensing && use_ray_lut && _ray_lut_available ? 4u : 0u) |
+        (disk_enabled ? 8u : 0u) | (disk_enabled && disk_clouds ? 16u : 0u) | (stars ? 32u : 0u);
+    if (!_variants[features]) _variants[features] = create_pipeline(features);
+    if (!env || !_context->pipelines->getGraphics("blackhole." + std::to_string(features), pipeline, pipeline_layout)) return color;
 
     RGImageDesc desc{};
     desc.name = "hdr.blackhole";
@@ -110,12 +155,22 @@ RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle co
             data.camera = glm::vec4(-glm::transpose(glm::mat3(scene.view)) * glm::vec3(scene.view[3]), 1.0f);
             data.center_radius = glm::vec4(glm::vec3(center - ctx->origin_world), radius);
             data.params = glm::vec4(step, thickness, meshes ? 1.0f : 0.0f, enabled && radius > 0.0f ? 1.0f : 0.0f);
+            data.ray_params = glm::vec4(use_ray_lut && _ray_lut_available ? 1.0f : 0.0f,
+                                        float(RayLut::MAX_STEP), float(RayLut::MAX_TRAVEL), 0.0f);
             data.star_params = glm::vec4(stars ? 1.0f : 0.0f, star_brightness, star_size, star_magnitude);
             data.disk_params = glm::vec4(disk && radius > 0.0f ? 1.0f : 0.0f,
                                          disk_inner, disk_outer, disk_brightness);
             data.disk_style = glm::vec4(disk_contrast,
                                         disk_clouds ? 1.0f : 0.0f, disk_time, disk_height);
             data.disk_optics = glm::vec4(disk_temperature, disk_absorption, disk_emission, 0.0f);
+            const float observer = glm::length(glm::vec3(data.camera) - glm::vec3(data.center_radius)) /
+                                   std::max(radius, 1e-6f);
+            data.disk_optics.w = 1.0f / std::sqrt(1.0f - 1.0f / std::max(observer, 1.001f));
+            const float anchor = disk_inner * 1.6f;
+            const float age = glm::mod(disk_time, 8.0f) - 4.0f;
+            data.disk_motion = glm::vec4(8.0f * std::sqrt(0.5f / (anchor * anchor * anchor)),
+                age, glm::mod(disk_time + 4.0f, 8.0f) - 4.0f,
+                0.5f + 0.5f * std::cos(age * (6.28318530718f / 8.0f)));
             data.disk_effects = glm::vec4(disk_redshift ? 1.0f : 0.0f, disk_doppler ? 1.0f : 0.0f,
                                           disk_beaming ? 1.0f : 0.0f, _disk_direction);
             const auto draw_extent = ctx->getDrawExtent();
@@ -146,6 +201,10 @@ RGImageHandle BlackholePass::register_graph(RenderGraph *graph, RGImageHandle co
                                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
             writer.write_buffer(4, _catalog.stars.buffer, VK_WHOLE_SIZE, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
             writer.write_buffer(5, _catalog.cells.buffer, VK_WHOLE_SIZE, 0, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER);
+            writer.write_image(6, _ray_lut.imageView, ctx->getSamplers()->linearClampEdge(),
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
+            writer.write_image(7, _blackbody_lut.imageView, ctx->getSamplers()->nearestClampEdge(),
+                               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER);
             writer.update_set(device->device(), set);
             vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
             vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline_layout, 0, 1, &set, 0, nullptr);

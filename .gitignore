@@ -1,3 +1,5 @@
+.gitignore
+
 # Build output
 /build/
 /build-*/
@@ -45,14 +47,8 @@ __pycache__/
 /captures/
 /media/
 
-# Video production: only Manim scene sources are tracked
-/video/*
-!/video/blackbody.py
-!/video/curved.py
-!/video/disk_paths.py
-!/video/geodesic_surface.py
-!/video/light_paths.py
-!/video/pixels.py
+# Video production sources and reference assets
+/video/
 
 # Vendored examples/build output
 /third_party/ImGuizmo/bin/
